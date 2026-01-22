@@ -4,6 +4,7 @@ import plotly.express as px
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
+import uuid  # 【新增】引入 UUID 模組以產生唯一識別碼
 
 # --- 1. 設定頁面配置 ---
 st.set_page_config(page_title="個人理財管家", page_icon="💰", layout="wide")
@@ -22,60 +23,79 @@ def get_google_sheet_client():
     )
     return gspread.authorize(creds)
 
-# --- 3. 讀取與寫入功能 (含刪除邏輯) ---
+# --- 3. 讀取與寫入功能 (修正版：導入 UUID 機制) ---
 
 def get_data():
-    """從 Google Sheet 讀取資料，並加上行號以便刪除"""
+    """從 Google Sheet 讀取資料"""
     client = get_google_sheet_client()
     sheet = client.open("my_expenses_db").sheet1
     
     # 讀取整張表 (包含空白行)
     all_rows = sheet.get_all_values()
     
-    # 如果只有標題或沒資料
+    # 定義標準欄位結構
+    expected_headers = ["date", "category", "amount", "note", "id"]
+
+    # 如果只有標題或沒資料，回傳空的 DataFrame (帶有標準欄位)
     if len(all_rows) <= 1:
-        return pd.DataFrame(columns=["row_id", "date", "category", "amount", "note"])
+        return pd.DataFrame(columns=expected_headers)
     
-    # 轉換成 DataFrame (第一行是標題)
-    # 標題應該是: date, category, amount, note
+    # 轉換成 DataFrame
     headers = all_rows[0]
     data = all_rows[1:]
     
     df = pd.DataFrame(data, columns=headers)
     
-    # 【關鍵】加上原始行號 (Row ID)
-    # Google Sheet 資料從第 2 行開始 (第 1 行是標題)
-    # 所以 index 0 的資料其實是 Sheet 的第 2 行
-    df['row_id'] = [i + 2 for i in range(len(df))]
+    # 【安全檢查】確保有 id 欄位 (防止舊表格結構導致錯誤)
+    if "id" not in df.columns:
+        st.error("⚠️ 資料表結構版本過舊，缺少 'id' 欄位。請清空 Google Sheet 後重新整理。")
+        return pd.DataFrame(columns=expected_headers)
     
     # 確保金額是數字格式
-    # 如果有空值或非數字，強制轉為 0
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
     
     return df
 
 def add_expense(date, category, amount, note):
-    """新增一筆資料"""
+    """新增一筆資料，並自動生成 UUID"""
     client = get_google_sheet_client()
     sheet = client.open("my_expenses_db").sheet1
     
-    # 如果是第一筆，先寫入標題
+    # 產生唯一的 36 碼 ID
+    unique_id = str(uuid.uuid4())
+    
+    # 如果是第一筆，先寫入標題 (包含 id)
     if not sheet.get_all_values():
-        sheet.append_row(["date", "category", "amount", "note"])
+        sheet.append_row(["date", "category", "amount", "note", "id"])
     
     date_str = date.strftime("%Y-%m-%d")
-    sheet.append_row([date_str, category, amount, note])
+    
+    # 將 ID 寫入最後一欄
+    sheet.append_row([date_str, category, amount, note, unique_id])
     
     # 清除快取，讓介面更新
     st.cache_data.clear()
 
-def delete_expense(row_id):
-    """根據行號刪除資料"""
+def delete_expense(target_id):
+    """
+    【核心修正】根據 UUID 刪除資料
+    不再依賴 row_id，而是去 Sheet 裡面 '搜尋' 這個 ID 在哪一行
+    """
     client = get_google_sheet_client()
     sheet = client.open("my_expenses_db").sheet1
     
-    sheet.delete_rows(int(row_id))
-    st.cache_data.clear()
+    try:
+        # 1. 在 Sheet 中搜尋這個 ID 的儲存格
+        cell = sheet.find(target_id)
+        
+        # 2. 找到後，刪除該儲存格所在的整行 (Row)
+        sheet.delete_rows(cell.row)
+        st.cache_data.clear()
+        
+    except gspread.exceptions.CellNotFound:
+        st.error("找不到該筆資料，可能已被刪除。")
+    except Exception as e:
+        st.error(f"刪除失敗: {e}")
 
 # --- 4. 主程式介面 ---
 
@@ -104,13 +124,13 @@ st.sidebar.markdown("---")
 st.sidebar.header("🗑️ 刪除/管理")
 
 # 準備刪除選單 (顯示最近 5 筆)
-if not df.empty:
-    # 排序：最新的在最上面
-    delete_df = df.sort_values(by='row_id', ascending=False).head(5)
+if not df.empty and 'id' in df.columns:
+    # 排序：依照日期降序 (最新的在最上面)
+    delete_df = df.sort_values(by='date', ascending=False).head(5)
     
-    # 製作選項標籤
+    # 製作選項標籤：顯示資訊 -> 對應到 UUID
     delete_options = {
-        f"{row['date']} - {row['category']} ${row['amount']} ({row['note']})": row['row_id']
+        f"{row['date']} - {row['category']} ${row['amount']} ({row['note']})": row['id']
         for index, row in delete_df.iterrows()
     }
     
@@ -120,9 +140,9 @@ if not df.empty:
     )
     
     if st.sidebar.button("確認刪除此筆"):
-        target_row_id = delete_options[selected_label]
+        target_id = delete_options[selected_label]  # 取得 UUID
         with st.spinner("正在刪除中..."):
-            delete_expense(target_row_id)
+            delete_expense(target_id)
         st.sidebar.success("刪除成功！")
         st.rerun()
 else:
@@ -187,10 +207,11 @@ if not df.empty:
         fig_line = px.line(daily_expense, x='date', y='amount', title='支出變化趨勢', markers=True)
         st.plotly_chart(fig_line, use_container_width=True)
 
-    # 4. 詳細資料表 (隱藏 row_id 欄位，不需要給使用者看)
+    # 4. 詳細資料表
+    # 【優化】顯示時隱藏 id 與 month 欄位，保持介面乾淨
     st.subheader("📋 詳細記錄")
     st.dataframe(
-        df.drop(columns=['row_id', 'month']).sort_values(by='date', ascending=False), 
+        df.drop(columns=['id', 'month'], errors='ignore').sort_values(by='date', ascending=False), 
         use_container_width=True
     )
 
