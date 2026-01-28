@@ -2,14 +2,16 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta # 需要 pip install python-dateutil
 import gspread
 from google.oauth2.service_account import Credentials
 import uuid
 import time
 import random
+import json
 
 # --- 1. 設定頁面配置 ---
-st.set_page_config(page_title="個人理財管家 Pro Max", page_icon="💳", layout="wide")
+st.set_page_config(page_title="個人理財管家", page_icon="💎", layout="wide")
 
 # ==========================================
 # 🔐 安全登入系統
@@ -34,28 +36,23 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # ==========================================
-# ⚙️ 系統設定與常數
+# ⚙️ 系統常數與設定
 # ==========================================
 
-CREDIT_CARDS = {
-    "現金": 0,
-    "聯邦 (結帳19日)": 19,
-    "兆豐-linepay (結帳5日)": 5,
-    "台新黑狗 (結帳2日)": 2,
-    "中信 (結帳12日)": 12
+# 擴充：加入「繳款日(後推天數)」的概念 (Gap Days)
+# 例如：結帳日是 19 號，通常 +15~20 天是繳款截止日
+CREDIT_CARDS_CONFIG = {
+    "現金": {"cutoff": 0, "gap": 0, "color": "#00CC96"},
+    "聯邦": {"cutoff": 19, "gap": 15, "color": "#636EFA"},
+    "兆豐-LinePay": {"cutoff": 5, "gap": 15, "color": "#AB63FA"},
+    "台新黑狗": {"cutoff": 2, "gap": 15, "color": "#EF553B"},
+    "中信": {"cutoff": 12, "gap": 20, "color": "#FFA15A"},
+    "銀行轉帳": {"cutoff": 0, "gap": 0, "color": "#7F7F7F"},
+    "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
 }
 
-PAYMENT_COLORS = {
-    "現金": "#00CC96",             
-    "聯邦 (結帳19日)": "#636EFA",   
-    "兆豐-linepay (結帳5日)": "#AB63FA", 
-    "台新黑狗 (結帳2日)": "#EF553B", 
-    "中信 (結帳12日)": "#FFA15A",   
-    "銀行轉帳": "#7F7F7F",         
-    "其他": "#BAB0AC"              
-}
-
-EXPECTED_HEADERS = ["date", "type", "category", "amount", "payment_method", "note", "id"]
+# 增加 tags 和 cash_flow_date 欄位
+EXPECTED_HEADERS = ["date", "cash_flow_date", "type", "category", "amount", "payment_method", "tags", "note", "id"]
 
 # --- 2. 連接 Google Sheets 設定 ---
 @st.cache_resource
@@ -75,10 +72,8 @@ def get_google_sheet_client():
         return None
 
 def get_spreadsheet():
-    """取得 Spreadsheet 物件，包含重試機制"""
     client = get_google_sheet_client()
     if not client: return None
-    
     for attempt in range(3):
         try:
             return client.open("my_expenses_db")
@@ -89,56 +84,123 @@ def get_spreadsheet():
             return None
     return None
 
-# --- 3. 核心功能：讀取、寫入、更新 ---
+# ==========================================
+# 🛠️ 進階功能：設定管理 (解決硬編碼與預算時空矛盾)
+# ==========================================
 
-# 🔥 新增：取得或建立設定分頁 (用來存預算)
-def get_settings_worksheet(sh):
+def init_settings_sheet(sh):
+    """初始化設定分頁，儲存類別與每月預算"""
     try:
-        ws = sh.worksheet("settings")
+        ws = sh.worksheet("app_settings")
     except gspread.exceptions.WorksheetNotFound:
-        # 如果沒有 settings 分頁，就建立一個，並寫入預設值
-        ws = sh.add_worksheet(title="settings", rows=20, cols=2)
-        ws.append_row(["key", "value"])
-        ws.append_row(["budget", "20000"])
+        ws = sh.add_worksheet(title="app_settings", rows=100, cols=3)
+        ws.append_row(["section", "key", "value"])
+        # 預設類別
+        default_cats = "飲食,交通,娛樂,購物,居住,醫療,投資,寵物,進修,其他"
+        default_income_cats = "薪資,獎金,投資收益,退款,兼職,其他"
+        ws.append_row(["categories", "expense", default_cats])
+        ws.append_row(["categories", "income", default_income_cats])
+        # 預設 2026-01 預算
+        ws.append_row(["budget", "2026-01", "20000"])
     return ws
 
-# 🔥 新增：讀取預算 (有 Cache)
-@st.cache_data(ttl=300) # 設定 5 分鐘快取，不需要頻繁讀取
-def get_budget_setting():
+@st.cache_data(ttl=60)
+def get_app_settings():
+    """讀取所有設定：類別、預算"""
     sh = get_spreadsheet()
-    if not sh: return 20000.0
+    if not sh: return {}, {}, {}
     
-    try:
-        ws = get_settings_worksheet(sh)
-        # 讀取所有設定
-        records = ws.get_all_records()
-        # 尋找 key 為 budget 的那一行
-        for item in records:
-            if item.get('key') == 'budget':
-                return float(item.get('value', 20000))
-    except Exception:
-        pass
+    ws = init_settings_sheet(sh)
+    records = ws.get_all_records()
     
-    return 20000.0 # 預設值
+    expense_cats = []
+    income_cats = []
+    monthly_budgets = {}
+    
+    for row in records:
+        if row['section'] == 'categories':
+            if row['key'] == 'expense':
+                expense_cats = row['value'].split(',')
+            elif row['key'] == 'income':
+                income_cats = row['value'].split(',')
+        elif row['section'] == 'budget':
+            monthly_budgets[row['key']] = float(row['value'])
+            
+    return expense_cats, income_cats, monthly_budgets
 
-# 🔥 新增：更新預算
-def update_budget_setting(new_budget):
+def update_monthly_budget(month_str, amount):
+    """更新特定月份的預算"""
     sh = get_spreadsheet()
-    if not sh: return
+    ws = init_settings_sheet(sh)
     
-    try:
-        ws = get_settings_worksheet(sh)
-        # 找到 'budget' 所在的儲存格
-        cell = ws.find("budget")
-        # 更新它右邊那一格 (B欄) 的值
-        ws.update_cell(cell.row, cell.col + 1, str(new_budget))
+    # 搜尋是否已有該月設定
+    cell = ws.find(month_str)
+    if cell:
+        # 如果有，更新 C 欄 (Value)
+        ws.update_cell(cell.row, 3, str(amount))
+    else:
+        # 如果沒有，新增一行
+        ws.append_row(["budget", month_str, str(amount)])
+    
+    get_app_settings.clear()
+
+def add_new_category(cat_type, new_cat):
+    """新增類別"""
+    sh = get_spreadsheet()
+    ws = init_settings_sheet(sh)
+    
+    # 找到對應的列
+    cell_key = ws.find(cat_type, in_column=2) # 找 key column
+    if cell_key:
+        # 讀取舊值
+        current_val = ws.cell(cell_key.row, 3).value
+        if new_cat not in current_val:
+            new_val = current_val + "," + new_cat
+            ws.update_cell(cell_key.row, 3, new_val)
+            get_app_settings.clear()
+            return True
+    return False
+
+# ==========================================
+# 🧮 核心邏輯：現金流與日期計算
+# ==========================================
+
+def calculate_cash_flow_info(date_obj, payment_method):
+    """
+    計算現金流日期 (Cash Flow Date) 與 繳款截止日
+    """
+    config = CREDIT_CARDS_CONFIG.get(payment_method, CREDIT_CARDS_CONFIG["其他"])
+    cutoff = config['cutoff']
+    gap = config['gap']
+    
+    if cutoff == 0:
+        # 現金或即時扣款
+        return date_obj, "當下結清"
+    
+    # 信用卡邏輯
+    # 如果消費日 <= 結帳日，則歸屬「當月帳單」
+    # 如果消費日 > 結帳日，則歸屬「下月帳單」
+    if date_obj.day <= cutoff:
+        billing_month = date_obj
+    else:
+        billing_month = date_obj + relativedelta(months=1)
         
-        # 清除讀取快取，確保下次讀到新的
-        get_budget_setting.clear()
-    except Exception as e:
-        st.error(f"預算儲存失敗: {e}")
+    # 推算結帳日日期 (例如 1月19日)
+    # 注意：需處理 2月沒有 30號的情況 (雖結帳日通常固定，但這裡簡化處理)
+    try:
+        billing_date = billing_month.replace(day=cutoff)
+    except ValueError:
+        # 如果該月沒有這一天 (例如2月沒有30號)，取該月最後一天
+        billing_date = billing_month + relativedelta(day=31)
+        
+    # 現金流日期 (繳款日) = 結帳日 + Gap Days
+    cash_flow_date = billing_date + timedelta(days=gap)
+    
+    return cash_flow_date, f"{billing_month.strftime('%Y-%m')} 帳單 (繳款日: {cash_flow_date.strftime('%m/%d')})"
 
-@st.cache_data(ttl=60, show_spinner="正在從雲端下載資料...")
+# --- 3. 核心功能：讀取、寫入、更新 ---
+
+@st.cache_data(ttl=60, show_spinner="正在同步雲端資料...")
 def get_data():
     sh = get_spreadsheet()
     if not sh: return pd.DataFrame()
@@ -151,9 +213,8 @@ def get_data():
     all_data = []
 
     for worksheet in all_worksheets:
-        # 跳過 settings 分頁，不要把它當成帳務資料讀進來
-        if worksheet.title == "settings":
-            continue
+        # 跳過設定頁
+        if worksheet.title == "app_settings": continue
 
         try:
             rows = worksheet.get_all_values()
@@ -161,7 +222,6 @@ def get_data():
             continue
 
         if len(rows) <= 1: continue 
-            
         headers = rows[0]
         if "id" not in headers or "date" not in headers: continue
 
@@ -174,9 +234,11 @@ def get_data():
             row_dict = dict(zip(headers, row))
             row_dict['_sheet_name'] = worksheet.title
             
-            if 'type' not in row_dict: row_dict['type'] = '支出'
-            if 'payment_method' not in row_dict: row_dict['payment_method'] = '現金'
-            if 'category' not in row_dict: row_dict['category'] = '其他'
+            # 欄位補全
+            if 'cash_flow_date' not in row_dict or not row_dict['cash_flow_date']:
+                # 舊資料相容：如果沒有現金流日期，暫時用消費日代替
+                row_dict['cash_flow_date'] = row_dict['date']
+            if 'tags' not in row_dict: row_dict['tags'] = ""
                 
             all_data.append(row_dict)
             
@@ -189,30 +251,131 @@ def get_data():
 
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
     df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+    df['cash_flow_date'] = pd.to_datetime(df['cash_flow_date'], errors='coerce').dt.date
     
     return df
 
 def get_or_create_worksheet(sh, sheet_name):
     try:
         worksheet = sh.worksheet(sheet_name)
+        # 檢查是否需要更新標題 (如果新增了欄位)
+        headers = worksheet.row_values(1)
+        if "tags" not in headers:
+             # 簡單處理：如果舊表沒新欄位，這裡不做 migrate，只在讀取時防呆
+             # 若要嚴謹應在此時 append column
+             pass
     except gspread.exceptions.WorksheetNotFound:
         time.sleep(1)
-        worksheet = sh.add_worksheet(title=sheet_name, rows=100, cols=10)
+        worksheet = sh.add_worksheet(title=sheet_name, rows=100, cols=12)
         worksheet.append_row(EXPECTED_HEADERS)
     return worksheet
 
-def add_transaction(date_obj, record_type, category, amount, payment_method, note):
+def add_transaction(date_obj, record_type, category, amount, payment_method, note, tags, installment_months=1):
+    """
+    新增交易，支援分期付款生成 (Installments)
+    """
     sh = get_spreadsheet()
     if not sh: return
 
-    sheet_name = date_obj.strftime("%Y-%m")
-    worksheet = get_or_create_worksheet(sh, sheet_name)
-    unique_id = str(uuid.uuid4())
-    date_str = date_obj.strftime("%Y-%m-%d")
+    # 計算單期金額 (四捨五入)
+    monthly_amount = round(amount / installment_months)
     
-    row_data = [date_str, record_type, category, amount, payment_method, note, unique_id]
-    worksheet.append_row(row_data)
+    # 批次寫入資料準備
+    operations = [] # (sheet_name, row_data)
+
+    current_date = date_obj
+    base_uuid = str(uuid.uuid4()) # 用來標記同一筆分期的 ID
+
+    for i in range(installment_months):
+        # 計算這一期的現金流日期
+        cf_date, _ = calculate_cash_flow_info(current_date, payment_method)
+        
+        # 分期備註
+        final_note = note
+        final_tags = tags
+        if installment_months > 1:
+            final_note = f"{note} ({i+1}/{installment_months})"
+            final_tags = f"{tags},#分期"
+        
+        # 決定分頁名稱 (依照消費日歸檔)
+        sheet_name = current_date.strftime("%Y-%m")
+        unique_id = str(uuid.uuid4())
+        
+        row_data = [
+            current_date.strftime("%Y-%m-%d"),
+            cf_date.strftime("%Y-%m-%d"), # Cash Flow Date
+            record_type,
+            category,
+            monthly_amount,
+            payment_method,
+            final_tags,
+            final_note,
+            unique_id
+        ]
+        
+        operations.append((sheet_name, row_data))
+        
+        # 日期推移到下個月
+        current_date = current_date + relativedelta(months=1)
+
+    # 執行寫入
+    for sheet_name, row in operations:
+        ws = get_or_create_worksheet(sh, sheet_name)
+        ws.append_row(row)
+        time.sleep(0.5) # 避免 Rate Limit
+
     get_data.clear()
+
+def safe_update_transaction(edited_row, original_row, sh):
+    """
+    安全性更新：先寫入新資料，確認無誤後刪除舊資料 (Atomic-like)
+    """
+    uid = edited_row['id']
+    origin_sheet_name = original_row['_sheet_name']
+    new_sheet_name = edited_row['date'].strftime("%Y-%m")
+    
+    # 1. 計算新的 Cash Flow Date
+    cf_date, _ = calculate_cash_flow_info(edited_row['date'], edited_row['payment_method'])
+    
+    new_values = [
+        edited_row['date'].strftime("%Y-%m-%d"),
+        cf_date.strftime("%Y-%m-%d"),
+        edited_row['type'],
+        edited_row['category'],
+        float(edited_row['amount']),
+        edited_row['payment_method'],
+        edited_row['tags'],
+        edited_row['note'],
+        uid # ID 保持不變
+    ]
+
+    try:
+        # A. 寫入新位置 (如果是同一個 Sheet，其實可以直接 Update，但為了統一邏輯，視為移動)
+        # 如果 Sheet 沒變，我們用 Update Cell，如果變了，用 Append + Delete
+        
+        if new_sheet_name == origin_sheet_name:
+            ws = sh.worksheet(origin_sheet_name)
+            cell = ws.find(uid)
+            # 更新 A:I (假設 ID 在 I)
+            # 注意：gspread update 範圍需要精確
+            # 這裡簡單作法：更新整列
+            range_name = f"A{cell.row}:I{cell.row}"
+            ws.update(range_name=range_name, values=[new_values])
+        else:
+            # 跨表移動：風險較高，採用兩段式
+            new_ws = get_or_create_worksheet(sh, new_sheet_name)
+            new_ws.append_row(new_values)
+            
+            # 確認寫入沒報錯後，刪除舊的
+            time.sleep(1)
+            old_ws = sh.worksheet(origin_sheet_name)
+            old_cell = old_ws.find(uid)
+            old_ws.delete_rows(old_cell.row)
+            
+        return True
+    except Exception as e:
+        st.error(f"更新失敗 ID {uid}: {e}")
+        return False
 
 def delete_transaction(sheet_name, target_id):
     sh = get_spreadsheet()
@@ -225,362 +388,245 @@ def delete_transaction(sheet_name, target_id):
     except Exception as e:
         st.error(f"刪除失敗：{e}")
 
-def update_transaction_batch(edited_df, original_df):
-    sh = get_spreadsheet()
-    if not sh: return
-    
-    original_map = original_df.set_index('id').to_dict('index')
-    changes_count = 0
-    progress_bar = st.progress(0)
-    total_rows = len(edited_df)
-    
-    for i, (index, row) in enumerate(edited_df.iterrows()):
-        uid = row['id']
-        if uid not in original_map: continue
-            
-        orig = original_map[uid]
-        has_changed = (
-            row['date'] != orig['date'] or 
-            row['type'] != orig['type'] or
-            row['category'] != orig['category'] or 
-            row['amount'] != orig['amount'] or 
-            row['payment_method'] != orig['payment_method'] or
-            row['note'] != orig['note']
-        )
-        
-        if has_changed:
-            origin_sheet_name = orig['_sheet_name']
-            new_sheet_name = row['date'].strftime("%Y-%m")
-            needs_move = (new_sheet_name != origin_sheet_name)
-            
-            time.sleep(0.5) 
-            
-            if needs_move:
-                try:
-                    old_ws = sh.worksheet(origin_sheet_name)
-                    cell = old_ws.find(uid)
-                    old_ws.delete_rows(cell.row)
-                    time.sleep(0.5)
-                    new_ws = get_or_create_worksheet(sh, new_sheet_name)
-                    new_ws.append_row([
-                        row['date'].strftime("%Y-%m-%d"),
-                        row['type'],
-                        row['category'],
-                        float(row['amount']),
-                        row['payment_method'],
-                        row['note'],
-                        uid
-                    ])
-                    changes_count += 1
-                except Exception as e:
-                    st.error(f"搬移失敗: {e}")
-            else:
-                try:
-                    ws = sh.worksheet(origin_sheet_name)
-                    cell = ws.find(uid)
-                    row_num = cell.row
-                    new_values = [
-                        row['date'].strftime("%Y-%m-%d"),
-                        row['type'],
-                        row['category'],
-                        float(row['amount']),
-                        row['payment_method'],
-                        row['note']
-                    ]
-                    ws.update(range_name=f"A{row_num}:F{row_num}", values=[new_values])
-                    changes_count += 1
-                except Exception as e:
-                    st.error(f"更新失敗: {e}")
-        progress_bar.progress((i + 1) / total_rows)
-
-    if changes_count > 0:
-        st.success(f"✅ 成功更新 {changes_count} 筆資料！")
-        get_data.clear()
-        time.sleep(1) 
-        st.rerun()
-    else:
-        st.info("沒有檢測到任何變更。")
-
-def calculate_billing_cycle(row):
-    if row['type'] == '收入': return "N/A"
-    pm = row.get('payment_method', '現金')
-    date = row['date']
-    if pd.isnull(date): return "日期錯誤"
-    
-    cutoff_day = CREDIT_CARDS.get(pm, 0)
-    
-    if cutoff_day == 0: return "當下結清"
-    
-    if date.day <= cutoff_day:
-        return f"{date.year}-{date.month:02d}月帳單"
-    else:
-        next_month_date = date.replace(day=1) + timedelta(days=32)
-        return f"{next_month_date.year}-{next_month_date.month:02d}月帳單"
-
 # --- 4. 主程式介面 ---
 
 if st.sidebar.button("🔒 登出系統"):
     st.session_state.logged_in = False
     st.rerun()
 
+# 讀取設定與資料
+expense_cats, income_cats, monthly_budgets = get_app_settings()
 df = get_data()
 
-# --- 側邊欄 ---
+# --- 側邊欄：新增交易 (功能升級) ---
 st.sidebar.header("📝 新增交易")
 record_type = st.sidebar.radio("類型", ["支出", "收入"], horizontal=True)
 
 with st.sidebar.form("expense_form", clear_on_submit=True):
-    date = st.date_input("日期", datetime.now())
+    date = st.date_input("交易日期", datetime.now())
     
     if record_type == "支出":
-        cat_options = ["飲食", "交通", "娛樂", "購物", "居住", "醫療", "投資", "寵物", "進修", "其他"]
-        payment_method = st.selectbox("付款方式", options=list(CREDIT_CARDS.keys()))
+        cat_options = expense_cats
+        payment_method = st.selectbox("付款方式", options=list(CREDIT_CARDS_CONFIG.keys()))
     else:
-        cat_options = ["薪資", "獎金", "投資收益", "退款", "兼職", "其他"]
+        cat_options = income_cats
         payment_method = st.selectbox("入帳方式", ["現金", "銀行轉帳"])
         
     category = st.selectbox("類別", cat_options)
     amount = st.number_input("金額", min_value=0.0, step=10.0, format="%.0f")
-    note = st.text_input("備註 (選填)")
+    note = st.text_input("備註")
+    tags = st.text_input("標籤 (Tag)", placeholder="例如: #日本旅遊, #專案A")
+    
+    # 🔥 進階功能：分期付款
+    is_installment = False
+    installment_months = 1
+    if record_type == "支出" and payment_method != "現金":
+        is_installment = st.checkbox("設定分期付款 (自動生成未來帳務)")
+        if is_installment:
+            installment_months = st.number_input("分期期數", min_value=2, max_value=36, value=3)
+    
     submitted = st.form_submit_button("提交")
 
     if submitted:
         if amount > 0:
             with st.spinner("正在寫入雲端..."):
-                add_transaction(date, record_type, category, amount, payment_method, note)
-            st.sidebar.success(f"已新增！")
+                add_transaction(date, record_type, category, amount, payment_method, note, tags, installment_months)
+            st.sidebar.success("已新增！")
+            time.sleep(1)
             st.rerun()
         else:
             st.sidebar.error("金額必須大於 0")
 
-st.sidebar.markdown("---")
-st.sidebar.header("🗑️ 快速刪除")
+# 🔥 側邊欄：新增類別 (解決硬編碼)
+with st.sidebar.expander("⚙️ 管理類別"):
+    new_cat_name = st.text_input("新增類別名稱")
+    new_cat_type = st.radio("新增至", ["支出", "收入"], horizontal=True)
+    if st.button("新增類別"):
+        key = "expense" if new_cat_type == "支出" else "income"
+        if add_new_category(key, new_cat_name):
+            st.success(f"已新增 {new_cat_name}")
+            st.rerun()
+        else:
+            st.warning("類別已存在")
 
-try:
-    if not df.empty and 'id' in df.columns:
-        delete_df = df.sort_values(by='date', ascending=False).head(10)
-        delete_options = {}
-        for index, row in delete_df.iterrows():
-            icon = "🔴" if row.get('type') == '支出' else "🟢"
-            pm = str(row.get('payment_method', ''))
-            pm_short = pm[:2] if pm else ""
-            cat = str(row.get('category', ''))
-            amt = row.get('amount', 0)
-            
-            label = f"{icon} {row['date']} {pm_short} - {cat} ${amt}"
-            delete_options[label] = (row.get('_sheet_name'), row.get('id'))
-        
-        selected_label = st.sidebar.selectbox("選擇項目", options=list(delete_options.keys()))
-        
-        if st.sidebar.button("確認刪除"):
-            if selected_label:
-                target_sheet, target_id = delete_options[selected_label]
-                with st.spinner("正在刪除..."):
-                    delete_transaction(target_sheet, target_id)
-                st.sidebar.success("刪除成功！")
-                st.rerun()
-except Exception as e:
-    st.sidebar.error(f"刪除選單載入錯誤: {e}")
+# --- 主畫面 ---
+st.title("💎 個人理財管家 Ultimate")
 
-st.sidebar.markdown("---")
-st.sidebar.header("⚙️ 設定")
-
-# 🔥 修正：從雲端讀取目前的預算 (而不是寫死 20000)
-current_budget_setting = get_budget_setting()
-
-# 讓使用者輸入新預算
-new_budget_input = st.sidebar.number_input(
-    "本月支出預算", 
-    min_value=1000.0, 
-    value=float(current_budget_setting), 
-    step=500.0,
-    format="%.0f"
-)
-
-# 🔥 增加一個按鈕來儲存預算，避免每次打字都觸發 API 導致卡頓
-if st.sidebar.button("💾 更新預算設定"):
-    if new_budget_input != current_budget_setting:
-        with st.spinner("正在儲存新預算..."):
-            update_budget_setting(new_budget_input)
-        st.sidebar.success(f"預算已更新為 ${new_budget_input:,.0f}")
-        time.sleep(1)
-        st.rerun()
-    else:
-        st.sidebar.info("預算未變更")
-
-# 設定變數給下方使用
-budget = new_budget_input
-
-# --- 主畫面儀表板 ---
-st.title("💳 智慧理財管家 (信用卡版)")
-
-if df is None:
-    st.error("⚠️ 資料讀取發生錯誤，請稍後再試。")
-elif df.empty:
-    st.info("💡 目前還沒有任何資料，請從左側新增第一筆！")
+if df.empty:
+    st.info("💡 目前沒有資料，請初始化您的第一筆帳務！(初次使用請稍等設定檔建立)")
 else:
     stats_df = df.copy()
-    stats_df['date'] = pd.to_datetime(stats_df['date'])
-    stats_df['month_str'] = stats_df['date'].dt.strftime("%Y-%m")
+    stats_df['month_str'] = stats_df['date'].apply(lambda x: x.strftime("%Y-%m"))
     
-    if 'payment_method' not in stats_df.columns: stats_df['payment_method'] = '現金'
-    if 'type' not in stats_df.columns: stats_df['type'] = '支出'
-
-    stats_df['billing_cycle'] = stats_df.apply(calculate_billing_cycle, axis=1)
-
+    # 選擇月份
     current_month_str = datetime.now().strftime("%Y-%m")
     available_months = sorted(stats_df['month_str'].unique(), reverse=True)
-    if current_month_str not in available_months:
-        available_months.insert(0, current_month_str)
-        
-    selected_month = st.selectbox("📅 選擇分析月份", available_months, index=0)
+    if current_month_str not in available_months: available_months.insert(0, current_month_str)
+    
+    col_filter1, col_filter2 = st.columns([1, 2])
+    with col_filter1:
+        selected_month = st.selectbox("📅 選擇月份", available_months)
+    with col_filter2:
+        tag_filter = st.text_input("🔍 標籤搜尋 (例如輸入 '旅遊')", "")
+
+    # 資料篩選
     current_month_df = stats_df[stats_df['month_str'] == selected_month]
-    
-    income_df = current_month_df[current_month_df['type'] == '收入']
-    expense_df = current_month_df[current_month_df['type'] == '支出']
-    
-    total_income = income_df['amount'].sum()
-    total_expense = expense_df['amount'].sum()
+    if tag_filter:
+        current_month_df = current_month_df[current_month_df['tags'].astype(str).str.contains(tag_filter)]
+
+    # 取得當月預算 (解決時空矛盾)
+    budget = monthly_budgets.get(selected_month, 20000) # 預設 20000
+
+    # 計算統計
+    total_income = current_month_df[current_month_df['type'] == '收入']['amount'].sum()
+    total_expense = current_month_df[current_month_df['type'] == '支出']['amount'].sum()
     net_balance = total_income - total_expense
-    remaining_budget = budget - total_expense
+    remaining = budget - total_expense
     
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("總收入", f"${total_income:,.0f}")
-    col2.metric("總支出", f"${total_expense:,.0f}", delta=f"-{total_expense:,.0f}", delta_color="inverse")
-    col3.metric("本月淨利", f"${net_balance:,.0f}", delta_color="normal" if net_balance >= 0 else "inverse")
-    col4.metric("剩餘預算", f"${remaining_budget:,.0f}", delta_color="normal" if remaining_budget > 0 else "inverse")
+    # 💰 指標顯示
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("總收入", f"${total_income:,.0f}")
+    c2.metric("總支出", f"${total_expense:,.0f}", delta=f"-{total_expense:,.0f}", delta_color="inverse")
+    c3.metric("本月淨利", f"${net_balance:,.0f}", delta_color="normal" if net_balance >= 0 else "inverse")
+    c4.metric(f"預算 ({selected_month})", f"${remaining:,.0f}", delta=f"預算 ${budget:,.0f}")
     
+    # 修改預算按鈕
+    with st.expander("✏️ 修改本月預算"):
+        new_budget_val = st.number_input("設定金額", value=float(budget), step=1000.0)
+        if st.button("更新預算"):
+            update_monthly_budget(selected_month, new_budget_val)
+            st.success("預算已更新！")
+            st.rerun()
+
     st.markdown("---")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader(f"📊 {selected_month} 付款方式占比")
-        if not expense_df.empty:
-            pay_stats = expense_df.groupby('payment_method')['amount'].sum().reset_index()
-            fig_pie = px.pie(
-                pay_stats, 
-                values='amount', 
-                names='payment_method', 
-                title='錢都花哪張卡？', 
-                hole=0.4,
-                color='payment_method', 
-                color_discrete_map=PAYMENT_COLORS 
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-        else:
-            st.info("本月尚無支出")
-
-    with c2:
-        st.subheader(f"📈 {selected_month} 支出類別")
-        if not expense_df.empty:
-            fig_bar = px.bar(
-                expense_df, 
-                x='category', 
-                y='amount', 
-                color='payment_method', 
-                title='各類別花費與支付方式',
-                color_discrete_map=PAYMENT_COLORS 
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-        else:
-            st.info("本月尚無資料")
-
-    # ==========================================
-    # 🔥 新增功能區塊：多週期趨勢分析
-    # ==========================================
-    st.markdown("---")
-    st.subheader("📈 長期收支趨勢分析")
+    # 📊 圖表分析
+    tab1, tab2, tab3 = st.tabs(["📊 收支概況", "💳 現金流分析 (New)", "🏷️ 專案/標籤分析"])
     
-    # 1. 週期選擇器
-    trend_period = st.radio("選擇統計週期", ["日", "週", "月", "季"], horizontal=True, key="trend_period")
-    
-    # 2. 資料準備
-    trend_df = stats_df.copy()
-    # 確保是 timestamp 格式以便進行 Resample
-    trend_df['date'] = pd.to_datetime(trend_df['date'])
-    
-    freq_map = {"日": "D", "週": "W-MON", "月": "MS", "季": "QS"}
-    freq = freq_map[trend_period]
-    
-    # 3. 聚合計算 (Grouping)
-    try:
-        # 依照選擇的頻率 (freq) 和 類型 (type) 進行加總
-        trend_grouped = trend_df.groupby([pd.Grouper(key='date', freq=freq), 'type'])['amount'].sum().reset_index()
-        trend_grouped = trend_grouped.sort_values('date')
-        
-        # 產生顯示用的日期字串
-        if trend_period == "日":
-            trend_grouped['date_str'] = trend_grouped['date'].dt.strftime('%Y-%m-%d')
-        elif trend_period == "週":
-            trend_grouped['date_str'] = trend_grouped['date'].dt.strftime('%Y-%m-%d (週)')
-        elif trend_period == "月":
-            trend_grouped['date_str'] = trend_grouped['date'].dt.strftime('%Y-%m')
-        elif trend_period == "季":
-            trend_grouped['date_str'] = trend_grouped['date'].apply(lambda x: f"{x.year}-Q{(x.month-1)//3 + 1}")
-
-        # 4. 繪製趨勢圖
-        fig_trend = px.bar(
-            trend_grouped, 
-            x='date_str', 
-            y='amount', 
-            color='type', 
-            barmode='group',
-            title=f'各{trend_period}收支總額統計',
-            labels={'date_str': '時間區間', 'amount': '金額', 'type': '類型'},
-            color_discrete_map={'支出': '#EF553B', '收入': '#00CC96'}
-        )
-        st.plotly_chart(fig_trend, use_container_width=True)
-        
-        # 5. 詳細報表表格
-        with st.expander(f"📊 查看 {trend_period} 詳細報表"):
-            # 轉置表格：日期為列，收入/支出為欄
-            pivot_df = trend_grouped.pivot(index='date_str', columns='type', values='amount').fillna(0)
-            # 計算淨利
-            pivot_df['淨利 (Net)'] = pivot_df.get('收入', 0) - pivot_df.get('支出', 0)
-            # 排序：最新的在上面
-            pivot_df = pivot_df.sort_index(ascending=False)
+    with tab1:
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if not current_month_df[current_month_df['type']=='支出'].empty:
+                fig = px.pie(current_month_df[current_month_df['type']=='支出'], values='amount', names='category', title='支出類別占比', hole=0.4)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("無支出資料")
+        with cc2:
+            # 趨勢圖 (日/週/月)
+            period = st.radio("趨勢週期", ["日", "週"], horizontal=True, key='trend_p')
+            trend_df = current_month_df.copy()
+            trend_df['date'] = pd.to_datetime(trend_df['date'])
+            freq = 'D' if period == '日' else 'W-MON'
             
-            # 美化表格顯示
-            st.dataframe(pivot_df.style.format("{:,.0f}").background_gradient(subset=['淨利 (Net)'], cmap="RdYlGn", vmin=-5000, vmax=5000))
-            
-    except Exception as e:
-        st.info("資料不足以進行此週期的趨勢分析。")
+            try:
+                g_df = trend_df.groupby([pd.Grouper(key='date', freq=freq), 'type'])['amount'].sum().reset_index()
+                fig_trend = px.bar(g_df, x='date', y='amount', color='type', barmode='group', 
+                                   color_discrete_map={'支出': '#EF553B', '收入': '#00CC96'})
+                st.plotly_chart(fig_trend, use_container_width=True)
+            except:
+                st.info("資料不足")
 
-    # ==========================================
-    # 結束新增區塊
-    # ==========================================
+    with tab2:
+        st.caption("💡 這裡顯示的是『實際扣款日』，而非消費日。這能幫助你預判月底要準備多少現金繳卡費。")
+        # 以 cash_flow_date 進行統計
+        cf_df = current_month_df.copy()
+        cf_df['day'] = pd.to_datetime(cf_df['cash_flow_date']).dt.day
+        
+        # 繪製現金流甘特圖概念或長條圖
+        fig_cf = px.bar(cf_df[cf_df['type']=='支出'], x='cash_flow_date', y='amount', color='payment_method', 
+                        title='未來30天現金流出預測 (依繳款日)',
+                        labels={'cash_flow_date': '預計扣款日', 'amount': '扣款金額'})
+        st.plotly_chart(fig_cf, use_container_width=True)
+
+    with tab3:
+        # 標籤雲與標籤統計
+        tags_series = current_month_df['tags'].str.split(',').explode().str.strip()
+        tags_series = tags_series[tags_series != ""] # 去除空標籤
+        
+        if not tags_series.empty:
+            tag_counts = tags_series.value_counts().reset_index()
+            tag_counts.columns = ['tag', 'count']
+            
+            # 計算每個 tag 的總花費
+            tag_amounts = {}
+            for tag in tag_counts['tag']:
+                # 簡單模糊搜尋
+                mask = current_month_df['tags'].astype(str).str.contains(tag)
+                amt = current_month_df[mask & (current_month_df['type']=='支出')]['amount'].sum()
+                tag_amounts[tag] = amt
+            
+            tag_counts['total_spent'] = tag_counts['tag'].map(tag_amounts)
+            
+            st.dataframe(tag_counts, use_container_width=True)
+            fig_tag = px.bar(tag_counts, x='tag', y='total_spent', title='各專案/標籤總支出')
+            st.plotly_chart(fig_tag, use_container_width=True)
+        else:
+            st.info("本月尚無設定標籤的交易")
 
     st.markdown("---")
-    st.subheader("📋 詳細記錄 & 帳單歸屬推算")
-    st.caption("💡 系統會根據結帳日，自動推算這筆消費屬於哪個月的信用卡帳單")
-
-    display_df = stats_df.sort_values(by='date', ascending=False)
     
-    all_categories = [
-        "飲食", "交通", "娛樂", "購物", "居住", "醫療", "投資", "寵物", "進修", 
-        "薪資", "獎金", "投資收益", "退款", "兼職", "其他"
-    ]
-    all_payment_methods = list(CREDIT_CARDS.keys()) + ["銀行轉帳"]
+    # 📋 資料編輯器
+    st.subheader("📋 詳細記錄")
+    
+    # 準備編輯器的 Options
+    all_cats = expense_cats + income_cats + ["其他"]
+    all_pm = list(CREDIT_CARDS_CONFIG.keys())
 
     edited_df = st.data_editor(
-        display_df,
+        current_month_df.sort_values('date', ascending=False),
         column_config={
             "id": None, 
             "_sheet_name": None,
-            "billing_cycle": st.column_config.TextColumn("帳單歸屬", disabled=True),
-            "date": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
+            "date": st.column_config.DateColumn("消費日期", format="YYYY-MM-DD"),
+            "cash_flow_date": st.column_config.DateColumn("現金流/繳款日", disabled=True), # 自動計算，不給改
             "type": st.column_config.SelectboxColumn("類型", options=["支出", "收入"], required=True, width="small"),
-            "category": st.column_config.SelectboxColumn("類別", options=all_categories, required=True),
-            "payment_method": st.column_config.SelectboxColumn("付款方式", options=all_payment_methods, required=True, width="medium"),
+            "category": st.column_config.SelectboxColumn("類別", options=all_cats, required=True),
+            "payment_method": st.column_config.SelectboxColumn("付款方式", options=all_pm, required=True),
             "amount": st.column_config.NumberColumn("金額", format="$ %.0f"),
+            "tags": st.column_config.TextColumn("標籤"),
             "note": st.column_config.TextColumn("備註"),
         },
         use_container_width=True,
         num_rows="fixed",
         hide_index=True,
-        key="data_editor"
+        key="data_editor_main"
     )
 
-    if st.button("💾 儲存修改", use_container_width=True):
-        with st.spinner("正在更新... (為確保穩定，動作會稍慢)"):
-            update_transaction_batch(edited_df, df)
+    if st.button("💾 儲存變更 (Save Changes)"):
+        with st.spinner("正在安全更新中..."):
+            sh = get_spreadsheet()
+            original_map = current_month_df.set_index('id').to_dict('index')
+            changes = 0
+            
+            progress = st.progress(0)
+            total = len(edited_df)
+            
+            for i, (idx, row) in enumerate(edited_df.iterrows()):
+                uid = row['id']
+                if uid not in original_map: continue
+                orig = original_map[uid]
+                
+                # 檢查是否變更
+                has_changed = (
+                    row['date'] != orig['date'] or 
+                    row['type'] != orig['type'] or 
+                    row['category'] != orig['category'] or 
+                    row['amount'] != orig['amount'] or 
+                    row['payment_method'] != orig['payment_method'] or
+                    row['tags'] != orig['tags'] or
+                    row['note'] != orig['note']
+                )
+                
+                if has_changed:
+                    if safe_update_transaction(row, orig, sh):
+                        changes += 1
+                        
+                progress.progress((i+1)/total)
+                
+            if changes > 0:
+                st.success(f"成功更新 {changes} 筆資料")
+                get_data.clear()
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.info("無資料變更")
