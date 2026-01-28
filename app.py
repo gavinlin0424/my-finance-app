@@ -485,6 +485,71 @@ else:
         else:
             st.info("本月尚無資料")
 
+    # ==========================================
+    # 🔥 新增功能區塊：多週期趨勢分析
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📈 長期收支趨勢分析")
+    
+    # 1. 週期選擇器
+    trend_period = st.radio("選擇統計週期", ["日", "週", "月", "季"], horizontal=True, key="trend_period")
+    
+    # 2. 資料準備
+    trend_df = stats_df.copy()
+    # 確保是 timestamp 格式以便進行 Resample
+    trend_df['date'] = pd.to_datetime(trend_df['date'])
+    
+    freq_map = {"日": "D", "週": "W-MON", "月": "MS", "季": "QS"}
+    freq = freq_map[trend_period]
+    
+    # 3. 聚合計算 (Grouping)
+    try:
+        # 依照選擇的頻率 (freq) 和 類型 (type) 進行加總
+        trend_grouped = trend_df.groupby([pd.Grouper(key='date', freq=freq), 'type'])['amount'].sum().reset_index()
+        trend_grouped = trend_grouped.sort_values('date')
+        
+        # 產生顯示用的日期字串
+        if trend_period == "日":
+            trend_grouped['date_str'] = trend_grouped['date'].dt.strftime('%Y-%m-%d')
+        elif trend_period == "週":
+            trend_grouped['date_str'] = trend_grouped['date'].dt.strftime('%Y-%m-%d (週)')
+        elif trend_period == "月":
+            trend_grouped['date_str'] = trend_grouped['date'].dt.strftime('%Y-%m')
+        elif trend_period == "季":
+            trend_grouped['date_str'] = trend_grouped['date'].apply(lambda x: f"{x.year}-Q{(x.month-1)//3 + 1}")
+
+        # 4. 繪製趨勢圖
+        fig_trend = px.bar(
+            trend_grouped, 
+            x='date_str', 
+            y='amount', 
+            color='type', 
+            barmode='group',
+            title=f'各{trend_period}收支總額統計',
+            labels={'date_str': '時間區間', 'amount': '金額', 'type': '類型'},
+            color_discrete_map={'支出': '#EF553B', '收入': '#00CC96'}
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
+        
+        # 5. 詳細報表表格
+        with st.expander(f"📊 查看 {trend_period} 詳細報表"):
+            # 轉置表格：日期為列，收入/支出為欄
+            pivot_df = trend_grouped.pivot(index='date_str', columns='type', values='amount').fillna(0)
+            # 計算淨利
+            pivot_df['淨利 (Net)'] = pivot_df.get('收入', 0) - pivot_df.get('支出', 0)
+            # 排序：最新的在上面
+            pivot_df = pivot_df.sort_index(ascending=False)
+            
+            # 美化表格顯示
+            st.dataframe(pivot_df.style.format("{:,.0f}").background_gradient(subset=['淨利 (Net)'], cmap="RdYlGn", vmin=-5000, vmax=5000))
+            
+    except Exception as e:
+        st.info("資料不足以進行此週期的趨勢分析。")
+
+    # ==========================================
+    # 結束新增區塊
+    # ==========================================
+
     st.markdown("---")
     st.subheader("📋 詳細記錄 & 帳單歸屬推算")
     st.caption("💡 系統會根據結帳日，自動推算這筆消費屬於哪個月的信用卡帳單")
