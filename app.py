@@ -18,7 +18,6 @@ def get_google_sheet_client():
         "https://www.googleapis.com/auth/drive"
     ]
     # 從 Streamlit Secrets 讀取金鑰
-    # 確保 .streamlit/secrets.toml 內有 gcp_service_account 設定
     try:
         creds = Credentials.from_service_account_info(
             st.secrets["gcp_service_account"],
@@ -37,7 +36,7 @@ def get_spreadsheet():
 
 # --- 3. 核心功能：讀取、寫入、更新 (支援分頁) ---
 
-# 定義新的標準欄位順序
+# 定義標準欄位順序
 EXPECTED_HEADERS = ["date", "type", "category", "amount", "note", "id"]
 
 def get_data():
@@ -101,11 +100,6 @@ def get_or_create_worksheet(sh, sheet_name):
     """取得指定名稱的分頁，若不存在則建立並寫入標題"""
     try:
         worksheet = sh.worksheet(sheet_name)
-        # 檢查是否需要更新標題 (簡單防呆，若第一列只有5個欄位，提示使用者)
-        headers = worksheet.row_values(1)
-        if "type" not in headers:
-             # 這裡僅做提示，不自動修改結構以免破壞資料，建議使用者手動處理舊月份
-             pass
     except gspread.exceptions.WorksheetNotFound:
         # 建立新分頁
         worksheet = sh.add_worksheet(title=sheet_name, rows=100, cols=10)
@@ -205,10 +199,7 @@ def update_transaction_batch(edited_df, original_df):
                     row_num = cell.row
                     
                     # 依序列 date, type, category, amount, note
-                    # 注意：這裡假設 Sheet 結構已更新為新版。如果舊 Sheet 結構不同，可能會錯位。
-                    # 為求安全，若發現欄位數不對，update 可能會有風險。
-                    # 但在此範例中，我們假設使用者已處理好舊資料或開始新月份。
-                    
+                    # 更新 A:E 欄 (因為 id 在 F)
                     new_values = [
                         row['date'].strftime("%Y-%m-%d"),
                         row['type'],
@@ -216,7 +207,6 @@ def update_transaction_batch(edited_df, original_df):
                         float(row['amount']),
                         row['note']
                     ]
-                    # 更新 A:E 欄 (因為 id 在 F)
                     ws.update(range_name=f"A{row_num}:E{row_num}", values=[new_values])
                     changes_count += 1
                 except Exception as e:
@@ -246,7 +236,7 @@ record_type = st.sidebar.radio("類型", ["支出", "收入"], horizontal=True)
 with st.sidebar.form("expense_form", clear_on_submit=True):
     date = st.date_input("日期", datetime.now())
     
-    # 動態調整類別選單
+    # 動態調整類別選單 (這裡是 Sidebar 用的，分開比較乾淨)
     if record_type == "支出":
         cat_options = ["飲食", "交通", "娛樂", "購物", "居住", "醫療", "投資", "寵物", "進修", "其他"]
     else:
@@ -327,7 +317,7 @@ if not df.empty:
     remaining_budget = budget - total_expense
     usage_percentage = (total_expense / budget) * 100 if budget > 0 else 0
 
-    # 1. 關鍵指標 (改為 4 欄以容納更多資訊)
+    # 1. 關鍵指標
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("總收入 (Income)", f"${total_income:,.0f}", delta_color="normal")
     col2.metric("總支出 (Expense)", f"${total_expense:,.0f}", delta=f"-{total_expense:,.0f}", delta_color="inverse")
@@ -368,6 +358,13 @@ if not df.empty:
     
     display_df = df.sort_values(by='date', ascending=False)
     
+    # --- 修正重點：這裡列出所有可能的類別，確保資料庫有值的都能顯示 ---
+    all_possible_categories = [
+        "飲食", "交通", "娛樂", "購物", "居住", "醫療", "投資", "寵物", "進修", # 支出
+        "薪資", "獎金", "投資收益", "退款", "兼職", # 收入
+        "其他"
+    ]
+
     # 編輯器設定
     edited_df = st.data_editor(
         display_df,
@@ -376,7 +373,11 @@ if not df.empty:
             "_sheet_name": None,
             "date": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
             "type": st.column_config.SelectboxColumn("類型", options=["支出", "收入"], required=True, width="small"),
-            "category": st.column_config.SelectboxColumn("類別", options=["飲食", "交通", "購物", "薪資", "其他"], required=True),
+            "category": st.column_config.SelectboxColumn(
+                "類別", 
+                options=all_possible_categories, # 修正：使用完整清單
+                required=True
+            ),
             "amount": st.column_config.NumberColumn("金額", format="$ %.0f"),
             "note": st.column_config.TextColumn("備註"),
         },
