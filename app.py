@@ -58,7 +58,6 @@ PAYMENT_COLORS = {
 EXPECTED_HEADERS = ["date", "type", "category", "amount", "payment_method", "note", "id"]
 
 # --- 2. 連接 Google Sheets 設定 ---
-# 這個函式負責連線，使用 cache_resource 保持連線物件
 @st.cache_resource
 def get_google_sheet_client():
     scopes = [
@@ -92,8 +91,53 @@ def get_spreadsheet():
 
 # --- 3. 核心功能：讀取、寫入、更新 ---
 
-# 🔥 重點修正：加上 @st.cache_data (TTL=60秒)
-# 這會把讀取到的資料暫存在記憶體 60 秒，避免你每動一下滑鼠就重新讀取一次 Google Sheet
+# 🔥 新增：取得或建立設定分頁 (用來存預算)
+def get_settings_worksheet(sh):
+    try:
+        ws = sh.worksheet("settings")
+    except gspread.exceptions.WorksheetNotFound:
+        # 如果沒有 settings 分頁，就建立一個，並寫入預設值
+        ws = sh.add_worksheet(title="settings", rows=20, cols=2)
+        ws.append_row(["key", "value"])
+        ws.append_row(["budget", "20000"])
+    return ws
+
+# 🔥 新增：讀取預算 (有 Cache)
+@st.cache_data(ttl=300) # 設定 5 分鐘快取，不需要頻繁讀取
+def get_budget_setting():
+    sh = get_spreadsheet()
+    if not sh: return 20000.0
+    
+    try:
+        ws = get_settings_worksheet(sh)
+        # 讀取所有設定
+        records = ws.get_all_records()
+        # 尋找 key 為 budget 的那一行
+        for item in records:
+            if item.get('key') == 'budget':
+                return float(item.get('value', 20000))
+    except Exception:
+        pass
+    
+    return 20000.0 # 預設值
+
+# 🔥 新增：更新預算
+def update_budget_setting(new_budget):
+    sh = get_spreadsheet()
+    if not sh: return
+    
+    try:
+        ws = get_settings_worksheet(sh)
+        # 找到 'budget' 所在的儲存格
+        cell = ws.find("budget")
+        # 更新它右邊那一格 (B欄) 的值
+        ws.update_cell(cell.row, cell.col + 1, str(new_budget))
+        
+        # 清除讀取快取，確保下次讀到新的
+        get_budget_setting.clear()
+    except Exception as e:
+        st.error(f"預算儲存失敗: {e}")
+
 @st.cache_data(ttl=60, show_spinner="正在從雲端下載資料...")
 def get_data():
     sh = get_spreadsheet()
@@ -102,12 +146,15 @@ def get_data():
     try:
         all_worksheets = sh.worksheets()
     except Exception:
-        # 如果連線失敗，回傳空 DataFrame 避免程式崩潰
         return pd.DataFrame(columns=EXPECTED_HEADERS + ['_sheet_name'])
 
     all_data = []
 
     for worksheet in all_worksheets:
+        # 跳過 settings 分頁，不要把它當成帳務資料讀進來
+        if worksheet.title == "settings":
+            continue
+
         try:
             rows = worksheet.get_all_values()
         except Exception:
@@ -116,20 +163,17 @@ def get_data():
         if len(rows) <= 1: continue 
             
         headers = rows[0]
-        # 簡單檢查標題
         if "id" not in headers or "date" not in headers: continue
 
         sheet_data = rows[1:]
         
         for row in sheet_data:
-            # 補齊欄位長度避免錯誤
             if len(row) < len(headers):
                 row += [""] * (len(headers) - len(row))
             
             row_dict = dict(zip(headers, row))
             row_dict['_sheet_name'] = worksheet.title
             
-            # 防呆預設值
             if 'type' not in row_dict: row_dict['type'] = '支出'
             if 'payment_method' not in row_dict: row_dict['payment_method'] = '現金'
             if 'category' not in row_dict: row_dict['category'] = '其他'
@@ -140,12 +184,9 @@ def get_data():
         return pd.DataFrame(columns=EXPECTED_HEADERS + ['_sheet_name'])
 
     df = pd.DataFrame(all_data)
-    
-    # 確保所有必要欄位都在
     for col in EXPECTED_HEADERS:
         if col not in df.columns: df[col] = ""
 
-    # 型別轉換
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
     df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
     
@@ -171,8 +212,6 @@ def add_transaction(date_obj, record_type, category, amount, payment_method, not
     
     row_data = [date_str, record_type, category, amount, payment_method, note, unique_id]
     worksheet.append_row(row_data)
-    
-    # 🔥 重要：寫入後清除快取，這樣下次讀取才會看到新資料
     get_data.clear()
 
 def delete_transaction(sheet_name, target_id):
@@ -182,7 +221,6 @@ def delete_transaction(sheet_name, target_id):
         worksheet = sh.worksheet(sheet_name)
         cell = worksheet.find(target_id)
         worksheet.delete_rows(cell.row)
-        # 🔥 清除快取
         get_data.clear()
     except Exception as e:
         st.error(f"刪除失敗：{e}")
@@ -257,7 +295,6 @@ def update_transaction_batch(edited_df, original_df):
 
     if changes_count > 0:
         st.success(f"✅ 成功更新 {changes_count} 筆資料！")
-        # 🔥 清除快取並重整
         get_data.clear()
         time.sleep(1) 
         st.rerun()
@@ -268,7 +305,6 @@ def calculate_billing_cycle(row):
     if row['type'] == '收入': return "N/A"
     pm = row.get('payment_method', '現金')
     date = row['date']
-    # 防呆：確保 date 不是 NaT (非時間格式)
     if pd.isnull(date): return "日期錯誤"
     
     cutoff_day = CREDIT_CARDS.get(pm, 0)
@@ -287,7 +323,6 @@ if st.sidebar.button("🔒 登出系統"):
     st.session_state.logged_in = False
     st.rerun()
 
-# 這裡會使用 Cache，如果之前讀過就不會再連線，速度會變快
 df = get_data()
 
 # --- 側邊欄 ---
@@ -321,14 +356,12 @@ with st.sidebar.form("expense_form", clear_on_submit=True):
 st.sidebar.markdown("---")
 st.sidebar.header("🗑️ 快速刪除")
 
-# 加入錯誤處理，避免因為資料格式錯誤導致側邊欄當機
 try:
     if not df.empty and 'id' in df.columns:
         delete_df = df.sort_values(by='date', ascending=False).head(10)
         delete_options = {}
         for index, row in delete_df.iterrows():
             icon = "🔴" if row.get('type') == '支出' else "🟢"
-            # 安全取得字串
             pm = str(row.get('payment_method', ''))
             pm_short = pm[:2] if pm else ""
             cat = str(row.get('category', ''))
@@ -351,7 +384,32 @@ except Exception as e:
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ 設定")
-budget = st.sidebar.number_input("本月支出預算", min_value=1000, value=20000, step=500)
+
+# 🔥 修正：從雲端讀取目前的預算 (而不是寫死 20000)
+current_budget_setting = get_budget_setting()
+
+# 讓使用者輸入新預算
+new_budget_input = st.sidebar.number_input(
+    "本月支出預算", 
+    min_value=1000.0, 
+    value=float(current_budget_setting), 
+    step=500.0,
+    format="%.0f"
+)
+
+# 🔥 增加一個按鈕來儲存預算，避免每次打字都觸發 API 導致卡頓
+if st.sidebar.button("💾 更新預算設定"):
+    if new_budget_input != current_budget_setting:
+        with st.spinner("正在儲存新預算..."):
+            update_budget_setting(new_budget_input)
+        st.sidebar.success(f"預算已更新為 ${new_budget_input:,.0f}")
+        time.sleep(1)
+        st.rerun()
+    else:
+        st.sidebar.info("預算未變更")
+
+# 設定變數給下方使用
+budget = new_budget_input
 
 # --- 主畫面儀表板 ---
 st.title("💳 智慧理財管家 (信用卡版)")
@@ -361,7 +419,6 @@ if df is None:
 elif df.empty:
     st.info("💡 目前還沒有任何資料，請從左側新增第一筆！")
 else:
-    # 正常顯示內容
     stats_df = df.copy()
     stats_df['date'] = pd.to_datetime(stats_df['date'])
     stats_df['month_str'] = stats_df['date'].dt.strftime("%Y-%m")
