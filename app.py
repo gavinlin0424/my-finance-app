@@ -498,9 +498,16 @@ else:
     available_months = sorted(stats_df['month_str'].unique(), reverse=True)
     if current_month_str not in available_months: available_months.insert(0, current_month_str)
     
+    # 🔥 自動切換到本月邏輯
+    try:
+        default_index = available_months.index(current_month_str)
+    except ValueError:
+        default_index = 0
+
     col_filter1, col_filter2 = st.columns([1, 2])
     with col_filter1:
-        selected_month = st.selectbox("📅 選擇月份", available_months)
+        # 加入 index 參數
+        selected_month = st.selectbox("📅 選擇月份", available_months, index=default_index)
     with col_filter2:
         tag_filter = st.text_input("🔍 標籤搜尋", "")
 
