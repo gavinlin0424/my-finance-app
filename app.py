@@ -125,7 +125,6 @@ def get_app_settings():
         elif section == 'budget':
             monthly_budgets[row['key']] = float(row['value'])
         elif section == 'subscription':
-            # key=名稱, value=JSON字串
             try:
                 data = json.loads(row['value'])
                 data['name'] = row['key']
@@ -165,7 +164,6 @@ def add_subscription_template(name, amount, category, payment_method, note):
     sh = get_spreadsheet()
     ws = init_settings_sheet(sh)
     
-    # 資料存成 JSON 字串
     value_data = {
         "amount": amount,
         "category": category,
@@ -174,14 +172,10 @@ def add_subscription_template(name, amount, category, payment_method, note):
     }
     json_str = json.dumps(value_data, ensure_ascii=False)
     
-    # 檢查是否已存在 (key=name)
-    # 這裡簡單處理：直接新增，讀取時會讀到多筆，但可用邏輯過濾。
-    # 更嚴謹是用 find 檢查。
     found = False
     records = ws.get_all_records()
     for i, row in enumerate(records):
         if row['section'] == 'subscription' and row['key'] == name:
-            # 更新現有
             ws.update_cell(i+2, 3, json_str) # +2 因為 header=1, index 從 0 開始
             found = True
             break
@@ -207,7 +201,6 @@ def generate_subscriptions_for_month(date_obj, subs_list):
     sheet_name = date_obj.strftime("%Y-%m")
     ws = get_or_create_worksheet(sh, sheet_name)
     
-    # 批次準備資料
     rows_to_add = []
     
     for sub in subs_list:
@@ -221,16 +214,15 @@ def generate_subscriptions_for_month(date_obj, subs_list):
             sub['category'],
             sub['amount'],
             sub['payment_method'],
-            "#固定支出", # 自動加上標籤
+            "#固定支出", 
             f"{sub['name']} ({sub['note']})",
             unique_id
         ]
         rows_to_add.append(row_data)
         
-    # 批次寫入
     for row in rows_to_add:
         ws.append_row(row)
-        time.sleep(0.3) # 稍微緩衝
+        time.sleep(0.3)
         
     get_data.clear()
 
@@ -397,13 +389,14 @@ def safe_update_transaction(edited_row, original_row, sh):
         return False
 
 def delete_transaction(sheet_name, target_id):
+    """刪除指定交易"""
     sh = get_spreadsheet()
     if not sh: return
     try:
         worksheet = sh.worksheet(sheet_name)
         cell = worksheet.find(target_id)
-        worksheet.delete_rows(cell.row)
-        get_data.clear()
+        if cell:
+            worksheet.delete_rows(cell.row)
     except Exception as e:
         st.error(f"刪除失敗：{e}")
 
@@ -587,60 +580,91 @@ else:
             st.info("本月尚無設定標籤的交易")
 
     st.markdown("---")
-    st.subheader("📋 詳細記錄")
+    
+    # ==========================================
+    # 🔥 核心修改區域：詳細記錄 (支援編輯與刪除)
+    # ==========================================
+    st.subheader("📋 詳細記錄 (可編輯與刪除)")
     
     all_cats = expense_cats + income_cats + ["其他"]
     all_pm = list(CREDIT_CARDS_CONFIG.keys())
 
+    # 設定 Data Editor，開啟 dynamic 模式以允許刪除
+    # 並強制定義欄位格式 (DateColumn, NumberColumn) 解決格式跑掉問題
     edited_df = st.data_editor(
         current_month_df.sort_values('date', ascending=False),
         column_config={
-            "id": None, 
-            "_sheet_name": None,
-            "date": st.column_config.DateColumn("消費日期", format="YYYY-MM-DD"),
-            "cash_flow_date": st.column_config.DateColumn("現金流/繳款日", disabled=True),
+            "id": None,  # 隱藏 ID
+            "_sheet_name": None, # 隱藏工作表名稱
+            "date": st.column_config.DateColumn("消費日期", format="YYYY-MM-DD", required=True),
+            "cash_flow_date": st.column_config.DateColumn("現金流/繳款日", disabled=True), 
             "type": st.column_config.SelectboxColumn("類型", options=["支出", "收入"], required=True, width="small"),
             "category": st.column_config.SelectboxColumn("類別", options=all_cats, required=True),
             "payment_method": st.column_config.SelectboxColumn("付款方式", options=all_pm, required=True),
-            "amount": st.column_config.NumberColumn("金額", format="$ %.0f"),
+            "amount": st.column_config.NumberColumn("金額", format="$ %.0f", required=True),
             "tags": st.column_config.TextColumn("標籤"),
             "note": st.column_config.TextColumn("備註"),
         },
         use_container_width=True,
-        num_rows="fixed",
+        num_rows="dynamic", # 🔥 允許新增與刪除列
         hide_index=True,
         key="data_editor_main"
     )
 
     if st.button("💾 儲存變更"):
-        with st.spinner("正在更新..."):
+        with st.spinner("正在同步雲端資料庫..."):
             sh = get_spreadsheet()
+            
+            # 建立原始資料的索引地圖
             original_map = current_month_df.set_index('id').to_dict('index')
-            changes = 0
-            progress = st.progress(0)
-            total = len(edited_df)
+            
+            # 取得編輯後的 ID 列表與原始 ID 列表
+            current_ids = set(row['id'] for i, row in edited_df.iterrows() if row['id'])
+            original_ids = set(original_map.keys())
+            
+            changes_count = 0
+            delete_count = 0
+
+            # --- A. 處理刪除 ---
+            deleted_ids = original_ids - current_ids
+            for uid in deleted_ids:
+                sheet_name = original_map[uid]['_sheet_name']
+                delete_transaction(sheet_name, uid)
+                delete_count += 1
+
+            # --- B. 處理修改 ---
+            progress_bar = st.progress(0)
+            total_rows = len(edited_df)
+            
             for i, (idx, row) in enumerate(edited_df.iterrows()):
                 uid = row['id']
-                if uid not in original_map: continue
+                if not uid or uid not in original_map: 
+                    continue # 略過新增的行 (建議使用左側欄位新增)
+                
                 orig = original_map[uid]
+                
+                # 檢查欄位變更
                 has_changed = (
-                    row['date'] != orig['date'] or 
+                    str(row['date']) != str(orig['date']) or 
                     row['type'] != orig['type'] or 
                     row['category'] != orig['category'] or 
-                    row['amount'] != orig['amount'] or 
+                    float(row['amount']) != float(orig['amount']) or 
                     row['payment_method'] != orig['payment_method'] or
-                    row['tags'] != orig['tags'] or
-                    row['note'] != orig['note']
+                    str(row['tags']) != str(orig['tags']) or
+                    str(row['note']) != str(orig['note'])
                 )
+                
                 if has_changed:
                     if safe_update_transaction(row, orig, sh):
-                        changes += 1
-                progress.progress((i+1)/total)
+                        changes_count += 1
                 
-            if changes > 0:
-                st.success(f"成功更新 {changes} 筆資料")
+                if total_rows > 0:
+                    progress_bar.progress((i + 1) / total_rows)
+            
+            if changes_count > 0 or delete_count > 0:
+                st.success(f"✅ 同步完成！更新 {changes_count} 筆，刪除 {delete_count} 筆。")
                 get_data.clear()
-                time.sleep(1)
+                time.sleep(1.5)
                 st.rerun()
             else:
-                st.info("無資料變更")
+                st.info("沒有偵測到任何變更。")
