@@ -11,42 +11,6 @@ import json
 # --- 1. 設定頁面配置 ---
 st.set_page_config(page_title="個人理財管家 Pro (Supabase版)", page_icon="💎", layout="wide")
 
-# ==========================================
-# 🔐 安全登入系統
-# ==========================================
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-
-def login():
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        st.title("🔒 請登入系統")
-        password = st.text_input("請輸入密碼", type="password")
-        if st.button("登入", use_container_width=True):
-            if password == "pcgi1835":
-                st.session_state.logged_in = True
-                st.rerun()
-            else:
-                st.error("❌ 密碼錯誤")
-
-if not st.session_state.logged_in:
-    login()
-    st.stop() 
-
-# ==========================================
-# ⚙️ 系統常數與連線設定
-# ==========================================
-
-CREDIT_CARDS_CONFIG = {
-    "現金": {"cutoff": 0, "gap": 0, "color": "#00CC96"},
-    "聯邦": {"cutoff": 19, "gap": 15, "color": "#636EFA"},
-    "兆豐-LinePay": {"cutoff": 5, "gap": 15, "color": "#AB63FA"},
-    "台新黑狗": {"cutoff": 2, "gap": 15, "color": "#EF553B"},
-    "中信": {"cutoff": 12, "gap": 20, "color": "#FFA15A"},
-    "銀行轉帳": {"cutoff": 0, "gap": 0, "color": "#7F7F7F"},
-    "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
-}
-
 # --- 初始化 Supabase 連線 ---
 @st.cache_resource
 def init_supabase():
@@ -61,7 +25,61 @@ def init_supabase():
 supabase = init_supabase()
 
 # ==========================================
-# 🛠️ 設定管理 (類別、預算、訂閱) - 改寫為 Supabase
+# ⚙️ 系統核心配置 (解決配置不一致問題)
+# ==========================================
+
+@st.cache_data(ttl=300) # 設定快取 5 分鐘，避免頻繁讀取
+def get_system_config():
+    """從資料庫讀取信用卡設定與系統密碼"""
+    if not supabase: return {}, "pcgi1835" # Fallback
+
+    # 預設設定 (萬一資料庫讀不到時的保底)
+    default_cards = {
+        "現金": {"cutoff": 0, "gap": 0, "color": "#00CC96"},
+        "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
+    }
+    default_pw = "pcgi1835"
+
+    try:
+        response = supabase.table('app_settings').select("*").eq("section", "system").execute()
+        for row in response.data:
+            if row['key_name'] == 'credit_cards_config':
+                default_cards = json.loads(row['value'])
+            elif row['key_name'] == 'admin_password':
+                default_pw = row['value']
+    except Exception:
+        pass
+        
+    return default_cards, default_pw
+
+# 🔥 動態讀取設定
+CREDIT_CARDS_CONFIG, ADMIN_PASSWORD = get_system_config()
+
+# ==========================================
+# 🔐 安全登入系統
+# ==========================================
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+
+def login():
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.title("🔒 請登入系統")
+        password = st.text_input("請輸入密碼", type="password")
+        if st.button("登入", use_container_width=True):
+            # 🔥 這裡不再寫死，而是比對資料庫來的密碼
+            if password == ADMIN_PASSWORD:
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("❌ 密碼錯誤")
+
+if not st.session_state.logged_in:
+    login()
+    st.stop() 
+
+# ==========================================
+# 🛠️ 設定管理 (類別、預算、訂閱)
 # ==========================================
 
 @st.cache_data(ttl=60)
@@ -69,7 +87,6 @@ def get_app_settings():
     """讀取所有設定：類別、預算、訂閱樣板"""
     if not supabase: return [], [], {}, []
     
-    # 從資料庫撈取所有設定
     response = supabase.table('app_settings').select("*").execute()
     data = response.data
     
@@ -78,15 +95,12 @@ def get_app_settings():
     monthly_budgets = {}
     subscriptions = [] 
     
-    # 預設值 (如果資料庫是空的)
     default_expense = "飲食,交通,娛樂,購物,居住,醫療,投資,寵物,進修,其他"
     default_income = "薪資,獎金,投資收益,退款,兼職,其他"
 
-    has_data = False
     for row in data:
-        has_data = True
         section = row['section']
-        key = row['key_name'] # 注意：我們在遷移時將 key 改名為 key_name
+        key = row['key_name']
         value = row['value']
 
         if section == 'categories':
@@ -101,37 +115,21 @@ def get_app_settings():
                 subscriptions.append(sub_data)
             except: pass
     
-    # 如果完全沒資料，回傳預設值 (防止報錯)
     if not expense_cats: expense_cats = default_expense.split(',')
     if not income_cats: income_cats = default_income.split(',')
             
     return expense_cats, income_cats, monthly_budgets, subscriptions
 
 def update_monthly_budget(month_str, amount):
-    """更新預算：使用 Upsert (有則更新，無則新增)"""
-    data = {
-        "section": "budget",
-        "key_name": month_str,
-        "value": str(amount)
-    }
-    # 透過 section 和 key_name 來判斷唯一性，需確保這兩欄位組合是 Unique (或透過程式邏輯控制)
-    # 這裡我們先用簡單的查詢判斷
     existing = supabase.table('app_settings').select("id").eq("section", "budget").eq("key_name", month_str).execute()
-    
     if existing.data:
-        # 更新
         supabase.table('app_settings').update({"value": str(amount)}).eq("id", existing.data[0]['id']).execute()
     else:
-        # 新增
-        supabase.table('app_settings').insert(data).execute()
-        
+        supabase.table('app_settings').insert({"section": "budget", "key_name": month_str, "value": str(amount)}).execute()
     get_app_settings.clear()
 
 def add_new_category(cat_type, new_cat):
-    """新增類別"""
     key = "expense" if cat_type == "expense" else "income"
-    
-    # 先抓目前的值
     existing = supabase.table('app_settings').select("*").eq("section", "categories").eq("key_name", key).execute()
     
     if existing.data:
@@ -145,33 +143,20 @@ def add_new_category(cat_type, new_cat):
         else:
             return False, "類別已存在"
     else:
-        # 如果還沒有任何類別設定，新增一筆
         data = {"section": "categories", "key_name": key, "value": new_cat}
         supabase.table('app_settings').insert(data).execute()
         get_app_settings.clear()
         return True, "新增成功"
 
 def add_subscription_template(name, amount, category, payment_method, note):
-    value_data = {
-        "amount": amount,
-        "category": category,
-        "payment_method": payment_method,
-        "note": note
-    }
+    value_data = {"amount": amount, "category": category, "payment_method": payment_method, "note": note}
     json_str = json.dumps(value_data, ensure_ascii=False)
-    
-    # 檢查是否已存在
     existing = supabase.table('app_settings').select("id").eq("section", "subscription").eq("key_name", name).execute()
     
     if existing.data:
         supabase.table('app_settings').update({"value": json_str}).eq("id", existing.data[0]['id']).execute()
     else:
-        supabase.table('app_settings').insert({
-            "section": "subscription",
-            "key_name": name,
-            "value": json_str
-        }).execute()
-        
+        supabase.table('app_settings').insert({"section": "subscription", "key_name": name, "value": json_str}).execute()
     get_app_settings.clear()
 
 def delete_subscription_template(name):
@@ -179,16 +164,11 @@ def delete_subscription_template(name):
     get_app_settings.clear()
 
 def generate_subscriptions_for_month(date_obj, subs_list):
-    """一鍵生成：批次寫入訂閱資料"""
-    
-    # 1. 檢查本月是否已存在 (避免重複)
-    # 這裡我們用比較寬鬆的判斷：檢查該月份是否有相同的 "Note"
     start_date = date_obj.replace(day=1).strftime("%Y-%m-%d")
-    # 下個月1號
     next_month = (date_obj.replace(day=28) + timedelta(days=4)).replace(day=1).strftime("%Y-%m-%d")
     
-    # 查詢本月所有交易
-    response = supabase.table('transactions').select("note").gte("date", start_date).lt("date", next_month).execute()
+    # 🔥 這裡也要確保只抓「未刪除」的資料來比對
+    response = supabase.table('transactions').select("note").gte("date", start_date).lt("date", next_month).is_("deleted_at", "null").execute()
     existing_notes = set([row['note'] for row in response.data if row.get('note')])
     
     rows_to_add = []
@@ -197,14 +177,12 @@ def generate_subscriptions_for_month(date_obj, subs_list):
     
     for sub in subs_list:
         target_note = f"{sub['name']} ({sub['note']})"
-        
         if target_note in existing_notes:
             skipped_count += 1
             continue
             
         cf_date, _ = calculate_cash_flow_info(date_obj, sub['payment_method'])
-        
-        row_data = {
+        rows_to_add.append({
             "date": date_obj.strftime("%Y-%m-%d"),
             "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
             "type": "支出",
@@ -213,8 +191,7 @@ def generate_subscriptions_for_month(date_obj, subs_list):
             "payment_method": sub['payment_method'],
             "tags": "#固定支出", 
             "note": target_note
-        }
-        rows_to_add.append(row_data)
+        })
         added_count += 1
         
     if rows_to_add:
@@ -228,9 +205,10 @@ def generate_subscriptions_for_month(date_obj, subs_list):
 # ==========================================
 
 def calculate_cash_flow_info(date_obj, payment_method):
-    config = CREDIT_CARDS_CONFIG.get(payment_method, CREDIT_CARDS_CONFIG["其他"])
-    cutoff = config['cutoff']
-    gap = config['gap']
+    # 🔥 這裡現在使用的是從 DB 載入的 config
+    config = CREDIT_CARDS_CONFIG.get(payment_method, CREDIT_CARDS_CONFIG.get("其他", {"cutoff": 0, "gap": 0}))
+    cutoff = config.get('cutoff', 0)
+    gap = config.get('gap', 0)
     
     if cutoff == 0:
         return date_obj, "當下結清"
@@ -248,16 +226,15 @@ def calculate_cash_flow_info(date_obj, payment_method):
     cash_flow_date = billing_date + timedelta(days=gap)
     return cash_flow_date, f"{billing_month.strftime('%Y-%m')} 帳單"
 
-# --- 3. 讀取與寫入 (Supabase 核心) ---
+# --- 3. 讀取與寫入 (Supabase 核心 + 軟刪除) ---
 
 @st.cache_data(ttl=60, show_spinner="正在從 Supabase 讀取資料...")
 def get_data():
     if not supabase: return pd.DataFrame()
 
-    # 直接選取所有交易資料
-    # 若資料量破萬，這裡可以改成只撈取 "最近 3 個月" 或分頁讀取
     try:
-        response = supabase.table('transactions').select("*").execute()
+        # 🔥 核心修改：只選取 deleted_at 為空的資料
+        response = supabase.table('transactions').select("*").is_("deleted_at", "null").execute()
         data = response.data
     except Exception as e:
         st.error(f"讀取資料失敗: {e}")
@@ -267,8 +244,6 @@ def get_data():
         return pd.DataFrame(columns=["date", "cash_flow_date", "type", "category", "amount", "payment_method", "tags", "note", "id"])
 
     df = pd.DataFrame(data)
-
-    # 確保資料型態正確
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
     df['date'] = pd.to_datetime(df['date']).dt.date
     df['cash_flow_date'] = pd.to_datetime(df['cash_flow_date']).dt.date
@@ -303,14 +278,11 @@ def add_transaction(date_obj, record_type, category, amount, payment_method, not
         rows_to_add.append(row_data)
         current_date = current_date + relativedelta(months=1)
 
-    # 一次性寫入 (Supabase 支援 Batch Insert)
     supabase.table('transactions').insert(rows_to_add).execute()
     get_data.clear()
 
 def safe_update_transaction(edited_row, original_row):
-    """更新交易：直接操作 DB ID"""
     uid = edited_row['id']
-    
     cf_date, _ = calculate_cash_flow_info(edited_row['date'], edited_row['payment_method'])
     
     update_data = {
@@ -332,10 +304,12 @@ def safe_update_transaction(edited_row, original_row):
         return False
 
 def delete_transaction(target_id):
-    """刪除指定交易"""
+    """軟刪除指定交易：更新 deleted_at 時間戳記"""
     if not supabase: return
     try:
-        supabase.table('transactions').delete().eq("id", target_id).execute()
+        # 🔥 核心修改：不是 delete() 而是 update()
+        now_str = datetime.now().isoformat()
+        supabase.table('transactions').update({"deleted_at": now_str}).eq("id", target_id).execute()
     except Exception as e:
         st.error(f"刪除失敗：{e}")
 
@@ -358,6 +332,7 @@ with st.sidebar.form("expense_form", clear_on_submit=True):
     
     if record_type == "支出":
         cat_options = expense_cats
+        # 🔥 使用動態讀取的信用卡設定
         payment_method = st.selectbox("付款方式", options=list(CREDIT_CARDS_CONFIG.keys()))
     else:
         cat_options = income_cats
@@ -382,7 +357,7 @@ with st.sidebar.form("expense_form", clear_on_submit=True):
             with st.spinner("正在寫入資料庫..."):
                 add_transaction(date, record_type, category, amount, payment_method, note, tags, installment_months)
             st.sidebar.success("已新增！")
-            time.sleep(0.5) # 稍微快一點，Supabase 很快
+            time.sleep(0.5) 
             st.rerun()
         else:
             st.sidebar.error("金額必須大於 0")
@@ -572,6 +547,7 @@ else:
     st.subheader("📋 詳細記錄 (可編輯與刪除)")
     
     all_cats = expense_cats + income_cats + ["其他"]
+    # 🔥 這裡使用動態載入的信用卡 key
     all_pm = list(CREDIT_CARDS_CONFIG.keys())
 
     edited_df = st.data_editor(
@@ -579,6 +555,7 @@ else:
         column_config={
             "id": None, 
             "created_at": None,
+            "deleted_at": None, # 隱藏軟刪除欄位
             "date": st.column_config.DateColumn("消費日期", format="YYYY-MM-DD", required=True),
             "cash_flow_date": st.column_config.DateColumn("現金流/繳款日", disabled=True), 
             "type": st.column_config.SelectboxColumn("類型", options=["支出", "收入"], required=True, width="small"),
@@ -603,7 +580,7 @@ else:
             changes_count = 0
             delete_count = 0
 
-            # 1. 刪除
+            # 1. 刪除 (實際上是軟刪除)
             deleted_ids = original_ids - current_ids
             for uid in deleted_ids:
                 delete_transaction(uid)
