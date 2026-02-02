@@ -3,15 +3,13 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-import gspread
-from google.oauth2.service_account import Credentials
+from supabase import create_client, Client
 import uuid
 import time
-import random
 import json
 
 # --- 1. 設定頁面配置 ---
-st.set_page_config(page_title="個人理財管家 Ultimate", page_icon="💎", layout="wide")
+st.set_page_config(page_title="個人理財管家 Pro (Supabase版)", page_icon="💎", layout="wide")
 
 # ==========================================
 # 🔐 安全登入系統
@@ -36,7 +34,7 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # ==========================================
-# ⚙️ 系統常數與設定
+# ⚙️ 系統常數與連線設定
 # ==========================================
 
 CREDIT_CARDS_CONFIG = {
@@ -49,126 +47,111 @@ CREDIT_CARDS_CONFIG = {
     "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
 }
 
-EXPECTED_HEADERS = ["date", "cash_flow_date", "type", "category", "amount", "payment_method", "tags", "note", "id"]
-
-# --- 2. 連接 Google Sheets 設定 ---
+# --- 初始化 Supabase 連線 ---
 @st.cache_resource
-def get_google_sheet_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+def init_supabase():
     try:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"],
-            scopes=scopes
-        )
-        return gspread.authorize(creds)
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["key"]
+        return create_client(url, key)
     except Exception as e:
-        st.error(f"無法連接 Google Sheet，請檢查 Secrets 設定: {e}")
+        st.error(f"Supabase 連線失敗，請檢查 secrets 設定: {e}")
         return None
 
-def get_spreadsheet():
-    client = get_google_sheet_client()
-    if not client: return None
-    for attempt in range(3):
-        try:
-            return client.open("my_expenses_db")
-        except gspread.exceptions.APIError:
-            time.sleep(2 + random.random())
-            continue
-        except Exception:
-            return None
-    return None
+supabase = init_supabase()
 
 # ==========================================
-# 🛠️ 進階功能：設定管理 (類別、預算、訂閱)
+# 🛠️ 設定管理 (類別、預算、訂閱) - 改寫為 Supabase
 # ==========================================
-
-def init_settings_sheet(sh):
-    """初始化設定分頁"""
-    try:
-        ws = sh.worksheet("app_settings")
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title="app_settings", rows=100, cols=3)
-        ws.append_row(["section", "key", "value"])
-        # 預設類別
-        default_cats = "飲食,交通,娛樂,購物,居住,醫療,投資,寵物,進修,其他"
-        default_income_cats = "薪資,獎金,投資收益,退款,兼職,其他"
-        ws.append_row(["categories", "expense", default_cats])
-        ws.append_row(["categories", "income", default_income_cats])
-        # 預設預算
-        ws.append_row(["budget", "2026-01", "20000"])
-    return ws
 
 @st.cache_data(ttl=60)
 def get_app_settings():
     """讀取所有設定：類別、預算、訂閱樣板"""
-    sh = get_spreadsheet()
-    if not sh: return {}, {}, {}, []
+    if not supabase: return [], [], {}, []
     
-    ws = init_settings_sheet(sh)
-    records = ws.get_all_records()
+    # 從資料庫撈取所有設定
+    response = supabase.table('app_settings').select("*").execute()
+    data = response.data
     
     expense_cats = []
     income_cats = []
     monthly_budgets = {}
-    subscriptions = [] # 儲存訂閱樣板
+    subscriptions = [] 
     
-    for row in records:
+    # 預設值 (如果資料庫是空的)
+    default_expense = "飲食,交通,娛樂,購物,居住,醫療,投資,寵物,進修,其他"
+    default_income = "薪資,獎金,投資收益,退款,兼職,其他"
+
+    has_data = False
+    for row in data:
+        has_data = True
         section = row['section']
+        key = row['key_name'] # 注意：我們在遷移時將 key 改名為 key_name
+        value = row['value']
+
         if section == 'categories':
-            if row['key'] == 'expense':
-                expense_cats = row['value'].split(',')
-            elif row['key'] == 'income':
-                income_cats = row['value'].split(',')
+            if key == 'expense': expense_cats = value.split(',')
+            elif key == 'income': income_cats = value.split(',')
         elif section == 'budget':
-            monthly_budgets[row['key']] = float(row['value'])
+            monthly_budgets[key] = float(value)
         elif section == 'subscription':
             try:
-                data = json.loads(row['value'])
-                data['name'] = row['key']
-                subscriptions.append(data)
-            except:
-                pass
+                sub_data = json.loads(value)
+                sub_data['name'] = key
+                subscriptions.append(sub_data)
+            except: pass
+    
+    # 如果完全沒資料，回傳預設值 (防止報錯)
+    if not expense_cats: expense_cats = default_expense.split(',')
+    if not income_cats: income_cats = default_income.split(',')
             
     return expense_cats, income_cats, monthly_budgets, subscriptions
 
 def update_monthly_budget(month_str, amount):
-    """更新預算"""
-    sh = get_spreadsheet()
-    ws = init_settings_sheet(sh)
-    cell = ws.find(month_str)
-    if cell:
-        ws.update_cell(cell.row, 3, str(amount))
+    """更新預算：使用 Upsert (有則更新，無則新增)"""
+    data = {
+        "section": "budget",
+        "key_name": month_str,
+        "value": str(amount)
+    }
+    # 透過 section 和 key_name 來判斷唯一性，需確保這兩欄位組合是 Unique (或透過程式邏輯控制)
+    # 這裡我們先用簡單的查詢判斷
+    existing = supabase.table('app_settings').select("id").eq("section", "budget").eq("key_name", month_str).execute()
+    
+    if existing.data:
+        # 更新
+        supabase.table('app_settings').update({"value": str(amount)}).eq("id", existing.data[0]['id']).execute()
     else:
-        ws.append_row(["budget", month_str, str(amount)])
+        # 新增
+        supabase.table('app_settings').insert(data).execute()
+        
     get_app_settings.clear()
 
 def add_new_category(cat_type, new_cat):
-    """新增類別 (功能優化)"""
-    sh = get_spreadsheet()
-    ws = init_settings_sheet(sh)
-    cell_key = ws.find(cat_type, in_column=2)
+    """新增類別"""
+    key = "expense" if cat_type == "expense" else "income"
     
-    if cell_key:
-        current_val = ws.cell(cell_key.row, 3).value
-        # 檢查是否已存在
-        current_list = current_val.split(',')
-        if new_cat not in current_list:
+    # 先抓目前的值
+    existing = supabase.table('app_settings').select("*").eq("section", "categories").eq("key_name", key).execute()
+    
+    if existing.data:
+        current_id = existing.data[0]['id']
+        current_val = existing.data[0]['value']
+        if new_cat not in current_val:
             new_val = current_val + "," + new_cat
-            ws.update_cell(cell_key.row, 3, new_val)
+            supabase.table('app_settings').update({"value": new_val}).eq("id", current_id).execute()
             get_app_settings.clear()
             return True, "新增成功"
         else:
             return False, "類別已存在"
-    return False, "找不到設定檔"
+    else:
+        # 如果還沒有任何類別設定，新增一筆
+        data = {"section": "categories", "key_name": key, "value": new_cat}
+        supabase.table('app_settings').insert(data).execute()
+        get_app_settings.clear()
+        return True, "新增成功"
 
-# 🔥 新增：訂閱/固定支出管理功能
 def add_subscription_template(name, amount, category, payment_method, note):
-    sh = get_spreadsheet()
-    ws = init_settings_sheet(sh)
-    
     value_data = {
         "amount": amount,
         "category": category,
@@ -177,80 +160,67 @@ def add_subscription_template(name, amount, category, payment_method, note):
     }
     json_str = json.dumps(value_data, ensure_ascii=False)
     
-    found = False
-    records = ws.get_all_records()
-    for i, row in enumerate(records):
-        if row['section'] == 'subscription' and row['key'] == name:
-            ws.update_cell(i+2, 3, json_str) # +2 因為 header=1, index 從 0 開始
-            found = True
-            break
-            
-    if not found:
-        ws.append_row(["subscription", name, json_str])
+    # 檢查是否已存在
+    existing = supabase.table('app_settings').select("id").eq("section", "subscription").eq("key_name", name).execute()
+    
+    if existing.data:
+        supabase.table('app_settings').update({"value": json_str}).eq("id", existing.data[0]['id']).execute()
+    else:
+        supabase.table('app_settings').insert({
+            "section": "subscription",
+            "key_name": name,
+            "value": json_str
+        }).execute()
         
     get_app_settings.clear()
 
 def delete_subscription_template(name):
-    sh = get_spreadsheet()
-    ws = init_settings_sheet(sh)
-    cell = ws.find(name)
-    if cell and ws.cell(cell.row, 1).value == 'subscription':
-        ws.delete_rows(cell.row)
-        get_app_settings.clear()
+    supabase.table('app_settings').delete().eq("section", "subscription").eq("key_name", name).execute()
+    get_app_settings.clear()
 
 def generate_subscriptions_for_month(date_obj, subs_list):
-    """一鍵生成：將訂閱列表寫入當月帳務 (包含重複檢查邏輯)"""
-    sh = get_spreadsheet()
-    if not sh: return
+    """一鍵生成：批次寫入訂閱資料"""
     
-    sheet_name = date_obj.strftime("%Y-%m")
-    ws = get_or_create_worksheet(sh, sheet_name)
+    # 1. 檢查本月是否已存在 (避免重複)
+    # 這裡我們用比較寬鬆的判斷：檢查該月份是否有相同的 "Note"
+    start_date = date_obj.replace(day=1).strftime("%Y-%m-%d")
+    # 下個月1號
+    next_month = (date_obj.replace(day=28) + timedelta(days=4)).replace(day=1).strftime("%Y-%m-%d")
     
-    # 1. 取得現有的資料，用於比對是否重複
-    try:
-        existing_records = ws.get_all_records()
-        # 建立一個集合，包含目前既有的 "Note" 內容，用於快速比對
-        # 我們假設固定支出的 Note 格式是 "名稱 (備註)"
-        existing_notes = set([str(row.get('note', '')) for row in existing_records])
-    except:
-        existing_notes = set()
-
+    # 查詢本月所有交易
+    response = supabase.table('transactions').select("note").gte("date", start_date).lt("date", next_month).execute()
+    existing_notes = set([row['note'] for row in response.data if row.get('note')])
+    
     rows_to_add = []
     added_count = 0
     skipped_count = 0
     
     for sub in subs_list:
-        # 組合出預期的 Note 格式
         target_note = f"{sub['name']} ({sub['note']})"
         
-        # 🔥 核心修正：檢查是否已存在
         if target_note in existing_notes:
             skipped_count += 1
             continue
             
         cf_date, _ = calculate_cash_flow_info(date_obj, sub['payment_method'])
-        unique_id = str(uuid.uuid4())
         
-        row_data = [
-            date_obj.strftime("%Y-%m-%d"),
-            cf_date.strftime("%Y-%m-%d"),
-            "支出",
-            sub['category'],
-            sub['amount'],
-            sub['payment_method'],
-            "#固定支出", 
-            target_note, # 使用組合好的 Note
-            unique_id
-        ]
+        row_data = {
+            "date": date_obj.strftime("%Y-%m-%d"),
+            "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
+            "type": "支出",
+            "category": sub['category'],
+            "amount": sub['amount'],
+            "payment_method": sub['payment_method'],
+            "tags": "#固定支出", 
+            "note": target_note
+        }
         rows_to_add.append(row_data)
         added_count += 1
         
-    # 批次寫入 (提升效能)
-    for row in rows_to_add:
-        ws.append_row(row)
-        time.sleep(0.3) # 避免 Google API Rate Limit
+    if rows_to_add:
+        supabase.table('transactions').insert(rows_to_add).execute()
+        get_data.clear()
         
-    get_data.clear()
     return added_count, skipped_count
 
 # ==========================================
@@ -278,72 +248,38 @@ def calculate_cash_flow_info(date_obj, payment_method):
     cash_flow_date = billing_date + timedelta(days=gap)
     return cash_flow_date, f"{billing_month.strftime('%Y-%m')} 帳單"
 
-# --- 3. 讀取與寫入 ---
+# --- 3. 讀取與寫入 (Supabase 核心) ---
 
-@st.cache_data(ttl=60, show_spinner="正在同步雲端資料...")
+@st.cache_data(ttl=60, show_spinner="正在從 Supabase 讀取資料...")
 def get_data():
-    sh = get_spreadsheet()
-    if not sh: return pd.DataFrame()
+    if not supabase: return pd.DataFrame()
 
+    # 直接選取所有交易資料
+    # 若資料量破萬，這裡可以改成只撈取 "最近 3 個月" 或分頁讀取
     try:
-        all_worksheets = sh.worksheets()
-    except Exception:
-        return pd.DataFrame(columns=EXPECTED_HEADERS + ['_sheet_name'])
+        response = supabase.table('transactions').select("*").execute()
+        data = response.data
+    except Exception as e:
+        st.error(f"讀取資料失敗: {e}")
+        return pd.DataFrame()
 
-    all_data = []
+    if not data:
+        return pd.DataFrame(columns=["date", "cash_flow_date", "type", "category", "amount", "payment_method", "tags", "note", "id"])
 
-    for worksheet in all_worksheets:
-        if worksheet.title == "app_settings": continue
+    df = pd.DataFrame(data)
 
-        try:
-            rows = worksheet.get_all_values()
-        except Exception:
-            continue
-
-        if len(rows) <= 1: continue 
-        headers = rows[0]
-        if "id" not in headers or "date" not in headers: continue
-
-        sheet_data = rows[1:]
-        for row in sheet_data:
-            if len(row) < len(headers):
-                row += [""] * (len(headers) - len(row))
-            row_dict = dict(zip(headers, row))
-            row_dict['_sheet_name'] = worksheet.title
-            
-            if 'cash_flow_date' not in row_dict or not row_dict['cash_flow_date']:
-                row_dict['cash_flow_date'] = row_dict['date']
-            if 'tags' not in row_dict: row_dict['tags'] = ""
-            all_data.append(row_dict)
-            
-    if not all_data:
-        return pd.DataFrame(columns=EXPECTED_HEADERS + ['_sheet_name'])
-
-    df = pd.DataFrame(all_data)
-    for col in EXPECTED_HEADERS:
-        if col not in df.columns: df[col] = ""
-
+    # 確保資料型態正確
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-    df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
-    df['cash_flow_date'] = pd.to_datetime(df['cash_flow_date'], errors='coerce').dt.date
+    df['date'] = pd.to_datetime(df['date']).dt.date
+    df['cash_flow_date'] = pd.to_datetime(df['cash_flow_date']).dt.date
     
     return df
 
-def get_or_create_worksheet(sh, sheet_name):
-    try:
-        worksheet = sh.worksheet(sheet_name)
-    except gspread.exceptions.WorksheetNotFound:
-        time.sleep(1)
-        worksheet = sh.add_worksheet(title=sheet_name, rows=100, cols=12)
-        worksheet.append_row(EXPECTED_HEADERS)
-    return worksheet
-
 def add_transaction(date_obj, record_type, category, amount, payment_method, note, tags, installment_months=1):
-    sh = get_spreadsheet()
-    if not sh: return
+    if not supabase: return
 
     monthly_amount = round(amount / installment_months)
-    operations = [] 
+    rows_to_add = []
     current_date = date_obj
 
     for i in range(installment_months):
@@ -354,76 +290,52 @@ def add_transaction(date_obj, record_type, category, amount, payment_method, not
             final_note = f"{note} ({i+1}/{installment_months})"
             final_tags = f"{tags},#分期"
         
-        sheet_name = current_date.strftime("%Y-%m")
-        unique_id = str(uuid.uuid4())
-        
-        row_data = [
-            current_date.strftime("%Y-%m-%d"),
-            cf_date.strftime("%Y-%m-%d"),
-            record_type,
-            category,
-            monthly_amount,
-            payment_method,
-            final_tags,
-            final_note,
-            unique_id
-        ]
-        operations.append((sheet_name, row_data))
+        row_data = {
+            "date": current_date.strftime("%Y-%m-%d"),
+            "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
+            "type": record_type,
+            "category": category,
+            "amount": monthly_amount,
+            "payment_method": payment_method,
+            "tags": final_tags,
+            "note": final_note
+        }
+        rows_to_add.append(row_data)
         current_date = current_date + relativedelta(months=1)
 
-    for sheet_name, row in operations:
-        ws = get_or_create_worksheet(sh, sheet_name)
-        ws.append_row(row)
-        time.sleep(0.5)
-
+    # 一次性寫入 (Supabase 支援 Batch Insert)
+    supabase.table('transactions').insert(rows_to_add).execute()
     get_data.clear()
 
-def safe_update_transaction(edited_row, original_row, sh):
+def safe_update_transaction(edited_row, original_row):
+    """更新交易：直接操作 DB ID"""
     uid = edited_row['id']
-    origin_sheet_name = original_row['_sheet_name']
-    new_sheet_name = edited_row['date'].strftime("%Y-%m")
     
     cf_date, _ = calculate_cash_flow_info(edited_row['date'], edited_row['payment_method'])
     
-    new_values = [
-        edited_row['date'].strftime("%Y-%m-%d"),
-        cf_date.strftime("%Y-%m-%d"),
-        edited_row['type'],
-        edited_row['category'],
-        float(edited_row['amount']),
-        edited_row['payment_method'],
-        edited_row['tags'],
-        edited_row['note'],
-        uid 
-    ]
-
+    update_data = {
+        "date": edited_row['date'].strftime("%Y-%m-%d"),
+        "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
+        "type": edited_row['type'],
+        "category": edited_row['category'],
+        "amount": float(edited_row['amount']),
+        "payment_method": edited_row['payment_method'],
+        "tags": edited_row['tags'],
+        "note": edited_row['note']
+    }
+    
     try:
-        if new_sheet_name == origin_sheet_name:
-            ws = sh.worksheet(origin_sheet_name)
-            cell = ws.find(uid)
-            range_name = f"A{cell.row}:I{cell.row}"
-            ws.update(range_name=range_name, values=[new_values])
-        else:
-            new_ws = get_or_create_worksheet(sh, new_sheet_name)
-            new_ws.append_row(new_values)
-            time.sleep(1)
-            old_ws = sh.worksheet(origin_sheet_name)
-            old_cell = old_ws.find(uid)
-            old_ws.delete_rows(old_cell.row)
+        supabase.table('transactions').update(update_data).eq("id", uid).execute()
         return True
     except Exception as e:
         st.error(f"更新失敗 ID {uid}: {e}")
         return False
 
-def delete_transaction(sheet_name, target_id):
+def delete_transaction(target_id):
     """刪除指定交易"""
-    sh = get_spreadsheet()
-    if not sh: return
+    if not supabase: return
     try:
-        worksheet = sh.worksheet(sheet_name)
-        cell = worksheet.find(target_id)
-        if cell:
-            worksheet.delete_rows(cell.row)
+        supabase.table('transactions').delete().eq("id", target_id).execute()
     except Exception as e:
         st.error(f"刪除失敗：{e}")
 
@@ -467,15 +379,15 @@ with st.sidebar.form("expense_form", clear_on_submit=True):
 
     if submitted:
         if amount > 0:
-            with st.spinner("正在寫入雲端..."):
+            with st.spinner("正在寫入資料庫..."):
                 add_transaction(date, record_type, category, amount, payment_method, note, tags, installment_months)
             st.sidebar.success("已新增！")
-            time.sleep(1)
+            time.sleep(0.5) # 稍微快一點，Supabase 很快
             st.rerun()
         else:
             st.sidebar.error("金額必須大於 0")
 
-# 🔥 側邊欄：新增類別 (新功能)
+# 🔥 側邊欄：新增類別
 with st.sidebar.expander("⚙️ 類別管理 (新增)"):
     new_cat_type = st.selectbox("類別類型", ["支出", "收入"], index=0)
     new_cat_name = st.text_input("輸入新類別名稱")
@@ -496,7 +408,6 @@ with st.sidebar.expander("⚙️ 類別管理 (新增)"):
 with st.sidebar.expander("🔄 訂閱/固定支出管家"):
     st.caption("設定房租、Netflix等固定開銷，每月可一鍵生成。")
     
-    # 新增樣板
     sub_name = st.text_input("名稱 (如: Netflix)")
     sub_amt = st.number_input("金額", min_value=0.0, step=10.0)
     sub_cat = st.selectbox("類別", expense_cats, key="sub_cat")
@@ -518,7 +429,6 @@ with st.sidebar.expander("🔄 訂閱/固定支出管家"):
             st.rerun()
             
     st.markdown("---")
-    # 一鍵生成按鈕
     gen_date = st.date_input("生成日期 (通常選每月1號)", datetime.now().replace(day=1))
     if st.button("⚡ 一鍵生成本月固定支出"):
         if subscriptions:
@@ -531,10 +441,10 @@ with st.sidebar.expander("🔄 訂閱/固定支出管家"):
             st.warning("請先新增樣板")
 
 # --- 主畫面 ---
-st.title("💎 個人理財管家 Ultimate")
+st.title("💎 個人理財管家 Pro")
 
 if df.empty:
-    st.info("💡 目前沒有資料，請初始化您的第一筆帳務！")
+    st.info("💡 目前資料庫中沒有資料，請建立第一筆帳務！")
 else:
     stats_df = df.copy()
     stats_df['month_str'] = stats_df['date'].apply(lambda x: x.strftime("%Y-%m"))
@@ -543,7 +453,6 @@ else:
     available_months = sorted(stats_df['month_str'].unique(), reverse=True)
     if current_month_str not in available_months: available_months.insert(0, current_month_str)
     
-    # 🔥 自動切換到本月邏輯
     try:
         default_index = available_months.index(current_month_str)
     except ValueError:
@@ -551,7 +460,6 @@ else:
 
     col_filter1, col_filter2 = st.columns([1, 2])
     with col_filter1:
-        # 加入 index 參數
         selected_month = st.selectbox("📅 選擇月份", available_months, index=default_index)
     with col_filter2:
         tag_filter = st.text_input("🔍 標籤搜尋", "")
@@ -582,7 +490,6 @@ else:
 
     st.markdown("---")
 
-    # 🔥 新增 Tab: 📅 每日明細
     tab1, tab2, tab3, tab4 = st.tabs(["📊 收支概況", "💳 現金流分析", "🏷️ 專案/標籤分析", "📅 每日明細"])
     
     with tab1:
@@ -607,7 +514,6 @@ else:
                 st.info("資料不足")
 
     with tab2:
-        st.caption("💡 這裡顯示的是『實際扣款日』，而非消費日。")
         cf_df = current_month_df.copy()
         fig_cf = px.bar(cf_df[cf_df['type']=='支出'], x='cash_flow_date', y='amount', color='payment_method', 
                         title='未來30天現金流出預測',
@@ -632,12 +538,10 @@ else:
         else:
             st.info("本月尚無設定標籤的交易")
 
-    # 🔥 每日明細邏輯
     with tab4:
         st.subheader("📆 每日消費查詢")
         search_date = st.date_input("選擇日期", datetime.now(), key='daily_search')
         
-        # 從總表篩選該日資料
         daily_mask = df['date'] == search_date
         daily_df = df[daily_mask]
         
@@ -650,7 +554,6 @@ else:
             k2.metric("當日收入", f"${d_income:,.0f}")
             k3.metric("筆數", f"{len(daily_df)} 筆")
             
-            # 顯示該日表格
             st.dataframe(
                 daily_df[['type', 'category', 'amount', 'note', 'payment_method', 'tags']],
                 use_container_width=True,
@@ -664,20 +567,18 @@ else:
     st.markdown("---")
     
     # ==========================================
-    # 🔥 核心修改區域：詳細記錄 (支援編輯與刪除)
+    # 🔥 詳細記錄 (編輯/刪除) - Supabase 版
     # ==========================================
     st.subheader("📋 詳細記錄 (可編輯與刪除)")
     
     all_cats = expense_cats + income_cats + ["其他"]
     all_pm = list(CREDIT_CARDS_CONFIG.keys())
 
-    # 設定 Data Editor，開啟 dynamic 模式以允許刪除
-    # 並強制定義欄位格式 (DateColumn, NumberColumn) 解決格式跑掉問題
     edited_df = st.data_editor(
         current_month_df.sort_values('date', ascending=False),
         column_config={
-            "id": None,  # 隱藏 ID
-            "_sheet_name": None, # 隱藏工作表名稱
+            "id": None, 
+            "created_at": None,
             "date": st.column_config.DateColumn("消費日期", format="YYYY-MM-DD", required=True),
             "cash_flow_date": st.column_config.DateColumn("現金流/繳款日", disabled=True), 
             "type": st.column_config.SelectboxColumn("類型", options=["支出", "收入"], required=True, width="small"),
@@ -688,44 +589,37 @@ else:
             "note": st.column_config.TextColumn("備註"),
         },
         use_container_width=True,
-        num_rows="dynamic", # 🔥 允許新增與刪除列
+        num_rows="dynamic",
         hide_index=True,
         key="data_editor_main"
     )
 
     if st.button("💾 儲存變更"):
-        with st.spinner("正在同步雲端資料庫..."):
-            sh = get_spreadsheet()
-            
-            # 建立原始資料的索引地圖
+        with st.spinner("正在同步資料庫..."):
             original_map = current_month_df.set_index('id').to_dict('index')
-            
-            # 取得編輯後的 ID 列表與原始 ID 列表
             current_ids = set(row['id'] for i, row in edited_df.iterrows() if row['id'])
             original_ids = set(original_map.keys())
             
             changes_count = 0
             delete_count = 0
 
-            # --- A. 處理刪除 ---
+            # 1. 刪除
             deleted_ids = original_ids - current_ids
             for uid in deleted_ids:
-                sheet_name = original_map[uid]['_sheet_name']
-                delete_transaction(sheet_name, uid)
+                delete_transaction(uid)
                 delete_count += 1
 
-            # --- B. 處理修改 ---
+            # 2. 修改
             progress_bar = st.progress(0)
             total_rows = len(edited_df)
             
             for i, (idx, row) in enumerate(edited_df.iterrows()):
                 uid = row['id']
-                if not uid or uid not in original_map: 
-                    continue # 略過新增的行 (建議使用左側欄位新增)
+                if not uid or uid not in original_map: continue 
                 
                 orig = original_map[uid]
                 
-                # 檢查欄位變更
+                # 簡單比對是否有變更
                 has_changed = (
                     str(row['date']) != str(orig['date']) or 
                     row['type'] != orig['type'] or 
@@ -737,7 +631,7 @@ else:
                 )
                 
                 if has_changed:
-                    if safe_update_transaction(row, orig, sh):
+                    if safe_update_transaction(row, orig):
                         changes_count += 1
                 
                 if total_rows > 0:
@@ -746,7 +640,7 @@ else:
             if changes_count > 0 or delete_count > 0:
                 st.success(f"✅ 同步完成！更新 {changes_count} 筆，刪除 {delete_count} 筆。")
                 get_data.clear()
-                time.sleep(1.5)
+                time.sleep(1)
                 st.rerun()
             else:
                 st.info("沒有偵測到任何變更。")
