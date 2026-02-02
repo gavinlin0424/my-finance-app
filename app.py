@@ -146,18 +146,23 @@ def update_monthly_budget(month_str, amount):
     get_app_settings.clear()
 
 def add_new_category(cat_type, new_cat):
-    """新增類別"""
+    """新增類別 (功能優化)"""
     sh = get_spreadsheet()
     ws = init_settings_sheet(sh)
     cell_key = ws.find(cat_type, in_column=2)
+    
     if cell_key:
         current_val = ws.cell(cell_key.row, 3).value
-        if new_cat not in current_val:
+        # 檢查是否已存在
+        current_list = current_val.split(',')
+        if new_cat not in current_list:
             new_val = current_val + "," + new_cat
             ws.update_cell(cell_key.row, 3, new_val)
             get_app_settings.clear()
-            return True
-    return False
+            return True, "新增成功"
+        else:
+            return False, "類別已存在"
+    return False, "找不到設定檔"
 
 # 🔥 新增：訂閱/固定支出管理功能
 def add_subscription_template(name, amount, category, payment_method, note):
@@ -194,16 +199,35 @@ def delete_subscription_template(name):
         get_app_settings.clear()
 
 def generate_subscriptions_for_month(date_obj, subs_list):
-    """一鍵生成：將訂閱列表寫入當月帳務"""
+    """一鍵生成：將訂閱列表寫入當月帳務 (包含重複檢查邏輯)"""
     sh = get_spreadsheet()
     if not sh: return
     
     sheet_name = date_obj.strftime("%Y-%m")
     ws = get_or_create_worksheet(sh, sheet_name)
     
+    # 1. 取得現有的資料，用於比對是否重複
+    try:
+        existing_records = ws.get_all_records()
+        # 建立一個集合，包含目前既有的 "Note" 內容，用於快速比對
+        # 我們假設固定支出的 Note 格式是 "名稱 (備註)"
+        existing_notes = set([str(row.get('note', '')) for row in existing_records])
+    except:
+        existing_notes = set()
+
     rows_to_add = []
+    added_count = 0
+    skipped_count = 0
     
     for sub in subs_list:
+        # 組合出預期的 Note 格式
+        target_note = f"{sub['name']} ({sub['note']})"
+        
+        # 🔥 核心修正：檢查是否已存在
+        if target_note in existing_notes:
+            skipped_count += 1
+            continue
+            
         cf_date, _ = calculate_cash_flow_info(date_obj, sub['payment_method'])
         unique_id = str(uuid.uuid4())
         
@@ -215,16 +239,19 @@ def generate_subscriptions_for_month(date_obj, subs_list):
             sub['amount'],
             sub['payment_method'],
             "#固定支出", 
-            f"{sub['name']} ({sub['note']})",
+            target_note, # 使用組合好的 Note
             unique_id
         ]
         rows_to_add.append(row_data)
+        added_count += 1
         
+    # 批次寫入 (提升效能)
     for row in rows_to_add:
         ws.append_row(row)
-        time.sleep(0.3)
+        time.sleep(0.3) # 避免 Google API Rate Limit
         
     get_data.clear()
+    return added_count, skipped_count
 
 # ==========================================
 # 🧮 核心邏輯
@@ -448,6 +475,23 @@ with st.sidebar.form("expense_form", clear_on_submit=True):
         else:
             st.sidebar.error("金額必須大於 0")
 
+# 🔥 側邊欄：新增類別 (新功能)
+with st.sidebar.expander("⚙️ 類別管理 (新增)"):
+    new_cat_type = st.selectbox("類別類型", ["支出", "收入"], index=0)
+    new_cat_name = st.text_input("輸入新類別名稱")
+    if st.button("➕ 新增類別"):
+        if new_cat_name:
+            target_key = "expense" if new_cat_type == "支出" else "income"
+            success, msg = add_new_category(target_key, new_cat_name)
+            if success:
+                st.success(f"已新增：{new_cat_name}")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.warning(msg)
+        else:
+            st.warning("請輸入名稱")
+
 # 🔥 側邊欄：訂閱與固定支出管理
 with st.sidebar.expander("🔄 訂閱/固定支出管家"):
     st.caption("設定房租、Netflix等固定開銷，每月可一鍵生成。")
@@ -478,9 +522,10 @@ with st.sidebar.expander("🔄 訂閱/固定支出管家"):
     gen_date = st.date_input("生成日期 (通常選每月1號)", datetime.now().replace(day=1))
     if st.button("⚡ 一鍵生成本月固定支出"):
         if subscriptions:
-            with st.spinner(f"正在生成 {len(subscriptions)} 筆資料..."):
-                generate_subscriptions_for_month(gen_date, subscriptions)
-            st.success("生成完成！")
+            with st.spinner(f"正在檢查與生成..."):
+                added, skipped = generate_subscriptions_for_month(gen_date, subscriptions)
+            st.success(f"生成完成！新增 {added} 筆，略過 {skipped} 筆(已存在)。")
+            time.sleep(1.5)
             st.rerun()
         else:
             st.warning("請先新增樣板")
@@ -537,7 +582,8 @@ else:
 
     st.markdown("---")
 
-    tab1, tab2, tab3 = st.tabs(["📊 收支概況", "💳 現金流分析", "🏷️ 專案/標籤分析"])
+    # 🔥 新增 Tab: 📅 每日明細
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 收支概況", "💳 現金流分析", "🏷️ 專案/標籤分析", "📅 每日明細"])
     
     with tab1:
         cc1, cc2 = st.columns(2)
@@ -585,6 +631,35 @@ else:
             st.plotly_chart(fig_tag, use_container_width=True)
         else:
             st.info("本月尚無設定標籤的交易")
+
+    # 🔥 每日明細邏輯
+    with tab4:
+        st.subheader("📆 每日消費查詢")
+        search_date = st.date_input("選擇日期", datetime.now(), key='daily_search')
+        
+        # 從總表篩選該日資料
+        daily_mask = df['date'] == search_date
+        daily_df = df[daily_mask]
+        
+        if not daily_df.empty:
+            d_income = daily_df[daily_df['type']=='收入']['amount'].sum()
+            d_expense = daily_df[daily_df['type']=='支出']['amount'].sum()
+            
+            k1, k2, k3 = st.columns(3)
+            k1.metric("當日支出", f"${d_expense:,.0f}")
+            k2.metric("當日收入", f"${d_income:,.0f}")
+            k3.metric("筆數", f"{len(daily_df)} 筆")
+            
+            # 顯示該日表格
+            st.dataframe(
+                daily_df[['type', 'category', 'amount', 'note', 'payment_method', 'tags']],
+                use_container_width=True,
+                column_config={
+                    "amount": st.column_config.NumberColumn("金額", format="$ %d")
+                }
+            )
+        else:
+            st.info(f"{search_date} 沒有任何交易記錄。")
 
     st.markdown("---")
     
