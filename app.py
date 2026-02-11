@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from supabase import create_client, Client
 import uuid
@@ -25,15 +25,14 @@ def init_supabase():
 supabase = init_supabase()
 
 # ==========================================
-# ⚙️ 系統核心配置 (解決配置不一致問題)
+# ⚙️ 系統核心配置
 # ==========================================
 
-@st.cache_data(ttl=300) # 設定快取 5 分鐘，避免頻繁讀取
+@st.cache_data(ttl=300)
 def get_system_config():
     """從資料庫讀取信用卡設定與系統密碼"""
-    if not supabase: return {}, "pcgi1835" # Fallback
+    if not supabase: return {}, "pcgi1835"
 
-    # 預設設定 (萬一資料庫讀不到時的保底)
     default_cards = {
         "現金": {"cutoff": 0, "gap": 0, "color": "#00CC96"},
         "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
@@ -52,7 +51,6 @@ def get_system_config():
         
     return default_cards, default_pw
 
-# 🔥 動態讀取設定
 CREDIT_CARDS_CONFIG, ADMIN_PASSWORD = get_system_config()
 
 # ==========================================
@@ -67,7 +65,6 @@ def login():
         st.title("🔒 請登入系統")
         password = st.text_input("請輸入密碼", type="password")
         if st.button("登入", use_container_width=True):
-            # 🔥 這裡不再寫死，而是比對資料庫來的密碼
             if password == ADMIN_PASSWORD:
                 st.session_state.logged_in = True
                 st.rerun()
@@ -79,12 +76,11 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # ==========================================
-# 🛠️ 設定管理 (類別、預算、訂閱)
+# 🛠️ 設定管理
 # ==========================================
 
 @st.cache_data(ttl=60)
 def get_app_settings():
-    """讀取所有設定：類別、預算、訂閱樣板"""
     if not supabase: return [], [], {}, []
     
     response = supabase.table('app_settings').select("*").execute()
@@ -167,7 +163,6 @@ def generate_subscriptions_for_month(date_obj, subs_list):
     start_date = date_obj.replace(day=1).strftime("%Y-%m-%d")
     next_month = (date_obj.replace(day=28) + timedelta(days=4)).replace(day=1).strftime("%Y-%m-%d")
     
-    # 🔥 這裡也要確保只抓「未刪除」的資料來比對
     response = supabase.table('transactions').select("note").gte("date", start_date).lt("date", next_month).is_("deleted_at", "null").execute()
     existing_notes = set([row['note'] for row in response.data if row.get('note')])
     
@@ -205,7 +200,6 @@ def generate_subscriptions_for_month(date_obj, subs_list):
 # ==========================================
 
 def calculate_cash_flow_info(date_obj, payment_method):
-    # 🔥 這裡現在使用的是從 DB 載入的 config
     config = CREDIT_CARDS_CONFIG.get(payment_method, CREDIT_CARDS_CONFIG.get("其他", {"cutoff": 0, "gap": 0}))
     cutoff = config.get('cutoff', 0)
     gap = config.get('gap', 0)
@@ -226,14 +220,13 @@ def calculate_cash_flow_info(date_obj, payment_method):
     cash_flow_date = billing_date + timedelta(days=gap)
     return cash_flow_date, f"{billing_month.strftime('%Y-%m')} 帳單"
 
-# --- 3. 讀取與寫入 (Supabase 核心 + 軟刪除) ---
+# --- 3. 讀取與寫入 ---
 
 @st.cache_data(ttl=60, show_spinner="正在從 Supabase 讀取資料...")
 def get_data():
     if not supabase: return pd.DataFrame()
 
     try:
-        # 🔥 核心修改：只選取 deleted_at 為空的資料
         response = supabase.table('transactions').select("*").is_("deleted_at", "null").execute()
         data = response.data
     except Exception as e:
@@ -304,10 +297,8 @@ def safe_update_transaction(edited_row, original_row):
         return False
 
 def delete_transaction(target_id):
-    """軟刪除指定交易：更新 deleted_at 時間戳記"""
     if not supabase: return
     try:
-        # 🔥 核心修改：不是 delete() 而是 update()
         now_str = datetime.now().isoformat()
         supabase.table('transactions').update({"deleted_at": now_str}).eq("id", target_id).execute()
     except Exception as e:
@@ -328,11 +319,10 @@ st.sidebar.header("📝 新增交易")
 record_type = st.sidebar.radio("類型", ["支出", "收入"], horizontal=True)
 
 with st.sidebar.form("expense_form", clear_on_submit=True):
-    date = st.date_input("交易日期", datetime.now())
+    date_val = st.date_input("交易日期", datetime.now())
     
     if record_type == "支出":
         cat_options = expense_cats
-        # 🔥 使用動態讀取的信用卡設定
         payment_method = st.selectbox("付款方式", options=list(CREDIT_CARDS_CONFIG.keys()))
     else:
         cat_options = income_cats
@@ -355,7 +345,7 @@ with st.sidebar.form("expense_form", clear_on_submit=True):
     if submitted:
         if amount > 0:
             with st.spinner("正在寫入資料庫..."):
-                add_transaction(date, record_type, category, amount, payment_method, note, tags, installment_months)
+                add_transaction(date_val, record_type, category, amount, payment_method, note, tags, installment_months)
             st.sidebar.success("已新增！")
             time.sleep(0.5) 
             st.rerun()
@@ -404,11 +394,11 @@ with st.sidebar.expander("🔄 訂閱/固定支出管家"):
             st.rerun()
             
     st.markdown("---")
-    gen_date = st.date_input("生成日期 (通常選每月1號)", datetime.now().replace(day=1))
+    gen_date_val = st.date_input("生成日期 (通常選每月1號)", datetime.now().replace(day=1))
     if st.button("⚡ 一鍵生成本月固定支出"):
         if subscriptions:
             with st.spinner(f"正在檢查與生成..."):
-                added, skipped = generate_subscriptions_for_month(gen_date, subscriptions)
+                added, skipped = generate_subscriptions_for_month(gen_date_val, subscriptions)
             st.success(f"生成完成！新增 {added} 筆，略過 {skipped} 筆(已存在)。")
             time.sleep(1.5)
             st.rerun()
@@ -465,7 +455,8 @@ else:
 
     st.markdown("---")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 收支概況", "💳 現金流分析", "🏷️ 專案/標籤分析", "📅 每日明細"])
+    # 🔥 新增 Tab 5: 🧮 自訂/多選計算機
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 收支概況", "💳 現金流分析", "🏷️ 專案/標籤分析", "📅 每日明細", "🧮 自訂/多選計算機"])
     
     with tab1:
         cc1, cc2 = st.columns(2)
@@ -539,6 +530,72 @@ else:
         else:
             st.info(f"{search_date} 沒有任何交易記錄。")
 
+    # 🔥 新功能：Tab 5 多選計算機
+    with tab5:
+        st.subheader("🧮 自訂範圍/多選計算機")
+        st.caption("勾選特定的交易，系統會自動幫您加總。")
+
+        # 模式 1：日期範圍快篩
+        with st.expander("📅 日期範圍篩選器", expanded=True):
+            col_d1, col_d2 = st.columns(2)
+            d_start = col_d1.date_input("開始日期", datetime.now().replace(day=1))
+            d_end = col_d2.date_input("結束日期", datetime.now())
+            
+            # 篩選資料
+            range_mask = (df['date'] >= d_start) & (df['date'] <= d_end)
+            range_df = df[range_mask].sort_values('date', ascending=False)
+        
+        # 模式 2：勾選加總
+        if not range_df.empty:
+            # 為了讓使用者勾選，我們需要在 dataframe 裡加一個 checkbox 欄位
+            # Streamlit 的 data_editor 支援這個功能
+            
+            # 先準備顯示的資料，只留重要欄位
+            display_df = range_df[['date', 'type', 'category', 'amount', 'note', 'tags']].copy()
+            # 預設增加一個 'Select' 欄位，全選 False
+            display_df.insert(0, "Select", False)
+            
+            edited_selection = st.data_editor(
+                display_df,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("選取", help="勾選以加入計算", default=False),
+                    "amount": st.column_config.NumberColumn("金額", format="$ %d"),
+                    "date": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed" # 禁止新增刪除，只許修改 checkbox
+            )
+            
+            # 計算勾選的項目
+            selected_rows = edited_selection[edited_selection["Select"] == True]
+            
+            st.markdown("---")
+            c_calc1, c_calc2, c_calc3 = st.columns(3)
+            
+            if not selected_rows.empty:
+                sel_income = selected_rows[selected_rows['type'] == '收入']['amount'].sum()
+                sel_expense = selected_rows[selected_rows['type'] == '支出']['amount'].sum()
+                sel_net = sel_income - sel_expense
+                sel_count = len(selected_rows)
+                
+                c_calc1.metric("已選筆數", f"{sel_count} 筆")
+                c_calc2.metric("已選總支出", f"${sel_expense:,.0f}")
+                c_calc3.metric("已選淨額", f"${sel_net:,.0f}", delta=f"收入 ${sel_income:,.0f}")
+                
+                # 顯示選取明細
+                with st.expander("查看選取項目明細"):
+                    st.dataframe(selected_rows.drop(columns=['Select']), use_container_width=True)
+            else:
+                # 如果都沒勾，預設顯示範圍內的總計
+                total_in_range_exp = range_df[range_df['type']=='支出']['amount'].sum()
+                c_calc1.metric("範圍內總筆數", f"{len(range_df)} 筆")
+                c_calc2.metric("範圍內總支出", f"${total_in_range_exp:,.0f}")
+                c_calc3.info("💡 請勾選上方表格來計算特定項目")
+                
+        else:
+            st.info("該日期範圍內沒有交易資料。")
+
     st.markdown("---")
     
     # ==========================================
@@ -547,7 +604,6 @@ else:
     st.subheader("📋 詳細記錄 (可編輯與刪除)")
     
     all_cats = expense_cats + income_cats + ["其他"]
-    # 🔥 這裡使用動態載入的信用卡 key
     all_pm = list(CREDIT_CARDS_CONFIG.keys())
 
     edited_df = st.data_editor(
@@ -555,7 +611,7 @@ else:
         column_config={
             "id": None, 
             "created_at": None,
-            "deleted_at": None, # 隱藏軟刪除欄位
+            "deleted_at": None,
             "date": st.column_config.DateColumn("消費日期", format="YYYY-MM-DD", required=True),
             "cash_flow_date": st.column_config.DateColumn("現金流/繳款日", disabled=True), 
             "type": st.column_config.SelectboxColumn("類型", options=["支出", "收入"], required=True, width="small"),
@@ -580,7 +636,7 @@ else:
             changes_count = 0
             delete_count = 0
 
-            # 1. 刪除 (實際上是軟刪除)
+            # 1. 刪除
             deleted_ids = original_ids - current_ids
             for uid in deleted_ids:
                 delete_transaction(uid)
@@ -596,7 +652,6 @@ else:
                 
                 orig = original_map[uid]
                 
-                # 簡單比對是否有變更
                 has_changed = (
                     str(row['date']) != str(orig['date']) or 
                     row['type'] != orig['type'] or 
