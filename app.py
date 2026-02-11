@@ -31,7 +31,7 @@ supabase = init_supabase()
 @st.cache_data(ttl=300)
 def get_system_config():
     """從資料庫讀取信用卡設定與系統密碼"""
-    # 預設值 (萬一連線失敗時的保命符)
+    # 預設值
     default_cards = {
         "現金": {"cutoff": 0, "gap": 0, "color": "#00CC96"},
         "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
@@ -183,4 +183,93 @@ def generate_subscriptions_for_month(date_obj, subs_list):
         cf_date, _ = calculate_cash_flow_info(date_obj, sub['payment_method'])
         rows_to_add.append({
             "date": date_obj.strftime("%Y-%m-%d"),
-            "cash_flow_date": cf_date.strftime("%Y-%m-%
+            "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
+            "type": "支出",
+            "category": sub['category'],
+            "amount": sub['amount'],
+            "payment_method": sub['payment_method'],
+            "tags": "#固定支出", 
+            "note": target_note
+        })
+        added_count += 1
+        
+    if rows_to_add:
+        supabase.table('transactions').insert(rows_to_add).execute()
+        get_data.clear()
+        
+    return added_count, skipped_count
+
+# 🧮 核心邏輯
+def calculate_cash_flow_info(date_obj, payment_method):
+    config = CREDIT_CARDS_CONFIG.get(payment_method, CREDIT_CARDS_CONFIG.get("其他", {"cutoff": 0, "gap": 0}))
+    cutoff = config.get('cutoff', 0)
+    gap = config.get('gap', 0)
+    
+    if cutoff == 0:
+        return date_obj, "當下結清"
+    
+    if date_obj.day <= cutoff:
+        billing_month = date_obj
+    else:
+        billing_month = date_obj + relativedelta(months=1)
+        
+    try:
+        billing_date = billing_month.replace(day=cutoff)
+    except ValueError:
+        billing_date = billing_month + relativedelta(day=31)
+        
+    cash_flow_date = billing_date + timedelta(days=gap)
+    return cash_flow_date, f"{billing_month.strftime('%Y-%m')} 帳單"
+
+# --- 3. 讀取與寫入 ---
+
+@st.cache_data(ttl=60, show_spinner="正在從 Supabase 讀取資料...")
+def get_data():
+    if not supabase: return pd.DataFrame()
+
+    try:
+        response = supabase.table('transactions').select("*").is_("deleted_at", "null").execute()
+        data = response.data
+    except Exception as e:
+        st.error(f"讀取資料失敗: {e}")
+        return pd.DataFrame()
+
+    if not data:
+        return pd.DataFrame(columns=["date", "cash_flow_date", "type", "category", "amount", "payment_method", "tags", "note", "id"])
+
+    df = pd.DataFrame(data)
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    df['date'] = pd.to_datetime(df['date']).dt.date
+    df['cash_flow_date'] = pd.to_datetime(df['cash_flow_date']).dt.date
+    
+    return df
+
+def add_transaction(date_obj, record_type, category, amount, payment_method, note, tags, installment_months=1):
+    if not supabase: return
+
+    monthly_amount = round(amount / installment_months)
+    rows_to_add = []
+    current_date = date_obj
+
+    for i in range(installment_months):
+        cf_date, _ = calculate_cash_flow_info(current_date, payment_method)
+        final_note = note
+        final_tags = tags
+        if installment_months > 1:
+            final_note = f"{note} ({i+1}/{installment_months})"
+            final_tags = f"{tags},#分期"
+        
+        row_data = {
+            "date": current_date.strftime("%Y-%m-%d"),
+            "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
+            "type": record_type,
+            "category": category,
+            "amount": monthly_amount,
+            "payment_method": payment_method,
+            "tags": final_tags,
+            "note": final_note
+        }
+        rows_to_add.append(row_data)
+        current_date = current_date + relativedelta(months=1)
+
+    supabase.table('transactions').
