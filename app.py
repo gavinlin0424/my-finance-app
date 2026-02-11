@@ -31,13 +31,14 @@ supabase = init_supabase()
 @st.cache_data(ttl=300)
 def get_system_config():
     """從資料庫讀取信用卡設定與系統密碼"""
-    if not supabase: return {}, "pcgi1835"
-
+    # 預設值 (萬一連線失敗時的保命符)
     default_cards = {
         "現金": {"cutoff": 0, "gap": 0, "color": "#00CC96"},
         "其他": {"cutoff": 0, "gap": 0, "color": "#BAB0AC"}
     }
     default_pw = "pcgi1835"
+
+    if not supabase: return default_cards, default_pw
 
     try:
         response = supabase.table('app_settings').select("*").eq("section", "system").execute()
@@ -51,6 +52,7 @@ def get_system_config():
         
     return default_cards, default_pw
 
+# 讀取設定
 CREDIT_CARDS_CONFIG, ADMIN_PASSWORD = get_system_config()
 
 # ==========================================
@@ -71,14 +73,16 @@ def login():
             else:
                 st.error("❌ 密碼錯誤")
 
+# 🔥 這裡非常重要：如果沒登入，顯示登入畫面並停止執行後續程式
 if not st.session_state.logged_in:
     login()
     st.stop() 
 
 # ==========================================
-# 🛠️ 設定管理
+# 📋 以下是登入後才會執行的主程式
 # ==========================================
 
+# 🛠️ 設定管理
 @st.cache_data(ttl=60)
 def get_app_settings():
     if not supabase: return [], [], {}, []
@@ -179,21 +183,4 @@ def generate_subscriptions_for_month(date_obj, subs_list):
         cf_date, _ = calculate_cash_flow_info(date_obj, sub['payment_method'])
         rows_to_add.append({
             "date": date_obj.strftime("%Y-%m-%d"),
-            "cash_flow_date": cf_date.strftime("%Y-%m-%d"),
-            "type": "支出",
-            "category": sub['category'],
-            "amount": sub['amount'],
-            "payment_method": sub['payment_method'],
-            "tags": "#固定支出", 
-            "note": target_note
-        })
-        added_count += 1
-        
-    if rows_to_add:
-        supabase.table('transactions').insert(rows_to_add).execute()
-        get_data.clear()
-        
-    return added_count, skipped_count
-
-# ==========================================
-# 🧮
+            "cash_flow_date": cf_date.strftime("%Y-%m-%
