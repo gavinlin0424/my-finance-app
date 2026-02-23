@@ -1,0 +1,28 @@
+name: Keep Supabase Alive
+
+on:
+  schedule:
+    # 設定為每週一、三、五的 UTC 凌晨 0 點執行 (Cron 語法)
+    - cron: '0 0 * * 1,3,5'
+  workflow_dispatch: # 允許手動觸發測試
+
+jobs:
+  ping-database:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11' # 配合你的環境
+
+      - name: Install dependencies
+        run: pip install supabase
+
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python ping_db.py
