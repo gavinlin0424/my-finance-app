@@ -7,6 +7,7 @@ from supabase import create_client, Client
 import uuid
 import time
 import json
+import re  # 👈 新增：用於解析文字的正則表達式套件
 
 # --- 1. 設定頁面配置 ---
 st.set_page_config(page_title="個人理財管家 Pro (Supabase版)", page_icon="💎", layout="wide")
@@ -269,7 +270,6 @@ def add_transaction(date_obj, record_type, category, amount, payment_method, not
         rows_to_add.append(row_data)
         current_date = current_date + relativedelta(months=1)
 
-    # 🔥 這裡就是剛剛報錯的地方，現在已經確保它是完整的一行
     supabase.table('transactions').insert(rows_to_add).execute()
     get_data.clear()
 
@@ -303,6 +303,107 @@ def delete_transaction(target_id):
     except Exception as e:
         st.error(f"刪除失敗：{e}")
 
+# ==========================================
+# 🤖 智慧文字解析引擎 (NLP Parser)
+# ==========================================
+def guess_category(item_name, available_cats):
+    """根據項目名稱自動猜測類別"""
+    keyword_map = {
+        "飲食": ["水果", "雞", "蛋", "魚", "蛤蜊", "菜", "麥當勞", "咖啡", "吃飯", "餐", "茶", "飲", "炸", "餐廳", "鍋", "肉", "便當"],
+        "購物": ["喜互惠", "7-11", "全家", "全聯", "超市", "超商", "百貨", "網購", "蝦皮", "鞭炮", "買", "家樂福"],
+        "交通": ["加油", "車票", "高鐵", "台鐵", "捷運", "客運", "停車", "計程車", "Uber", "機車"],
+        "娛樂": ["電影", "唱歌", "遊戲", "玩具", "旅遊", "飯店", "住宿", "門票", "出遊"],
+        "居住": ["房租", "水費", "電費", "瓦斯", "網路", "管理費", "家具", "日用品"],
+        "醫療": ["看診", "醫", "藥", "診所", "保健", "掛號"]
+    }
+    
+    for cat, keywords in keyword_map.items():
+        if cat in available_cats:
+            for kw in keywords:
+                if kw in item_name:
+                    return cat
+    
+    # 若猜不到，回傳第一個可用類別或「其他」
+    return "其他" if "其他" in available_cats else available_cats[0]
+
+def parse_bulk_text(text, available_cats):
+    """解析自由格式文字，提取日期、金額、標籤與自動分類"""
+    records = []
+    current_date = datetime.now()
+    global_tags = []
+    
+    lines = text.strip().split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        
+        # 1. 抓取所有 #標籤
+        line_tags = re.findall(r'#(\w+)', line)
+        line_no_tags = re.sub(r'#\w+', '', line).strip()
+        
+        # 2. 處理日期宣告行 (例如: 2/15)
+        date_match = re.search(r'^(\d{1,2})/(\d{1,2})', line_no_tags)
+        if date_match:
+            month = int(date_match.group(1))
+            day = int(date_match.group(2))
+            current_date = datetime(datetime.now().year, month, day)
+            
+            # 檢查日期後面是否還有消費文字
+            rest_of_line = line_no_tags[date_match.end():].strip()
+            if not rest_of_line:
+                global_tags = line_tags # 設定該日期的全域標籤
+                continue
+            else:
+                line_no_tags = rest_of_line # 日期同行也有消費紀錄
+                
+        # 3. 清洗字串並抓取金額與算式
+        clean_line = line_no_tags.replace(',', '').replace('＝', '=').replace(' ', ' ')
+        clean_line = re.sub(r'\s+', ' ', clean_line).strip()
+        
+        amount = 0
+        item_name = ""
+        
+        # 嘗試找等號後面的數字 (如: = 1098)
+        eq_match = re.search(r'=\s*(\d+(?:\.\d+)?)\s*$', clean_line)
+        if eq_match:
+            amount = float(eq_match.group(1))
+            item_name = clean_line[:eq_match.start()].strip()
+            item_name = re.sub(r'[\d\s\+\-\*\/\.]+$', '', item_name).strip() # 移除算式
+        else:
+            # 找字尾被空白分開的數字 (如: 炸物 460)
+            amt_match = re.search(r'(?<=\s)(\d+(?:\.\d+)?)\s*$', clean_line)
+            if amt_match:
+                amount = float(amt_match.group(1))
+                item_name = clean_line[:amt_match.start()].strip()
+            else:
+                # 找緊緊黏在一起的數字 (如: 蘋果50)
+                amt_match_tight = re.search(r'(\d+(?:\.\d+)?)\s*$', clean_line)
+                if amt_match_tight:
+                    amount = float(amt_match_tight.group(1))
+                    item_name = clean_line[:amt_match_tight.start()].strip()
+                else:
+                    continue # 解析不到金額，跳過此行
+                    
+        if not item_name: item_name = "未命名項目"
+            
+        # 4. 整合標籤
+        combined_tags = list(set(global_tags + line_tags))
+        tags_str = ",".join([f"#{t}" for t in combined_tags])
+        
+        # 5. 自動猜測分類
+        category = guess_category(item_name, available_cats)
+        
+        records.append({
+            "date": current_date.date(),
+            "category": category,
+            "amount": amount,
+            "note": item_name,
+            "tags": tags_str,
+            "payment_method": "現金" # 預設入帳方式
+        })
+        
+    return records
+
 # --- 4. 主程式介面 ---
 
 if st.sidebar.button("🔒 登出系統"):
@@ -313,8 +414,41 @@ if st.sidebar.button("🔒 登出系統"):
 expense_cats, income_cats, monthly_budgets, subscriptions = get_app_settings()
 df = get_data()
 
-# --- 側邊欄：新增交易 ---
-st.sidebar.header("📝 新增交易")
+# ==========================================
+# 🔥 側邊欄：智慧批次記帳 (新功能)
+# ==========================================
+with st.sidebar.expander("🤖 智慧文字批次記帳", expanded=True):
+    st.caption("支援日期切換 (如 2/15)、標籤 (#旅遊) 與算式。系統會自動幫您分類。")
+    bulk_text = st.text_area("貼上紀錄", height=200, placeholder="2/15 #辦年貨\n水果1680\n7-11  163\n2/19\n午餐 528+220 = 748")
+    
+    if st.button("⚡ 智慧解析並寫入", use_container_width=True):
+        if bulk_text:
+            parsed_data = parse_bulk_text(bulk_text, expense_cats)
+            
+            if not parsed_data:
+                st.warning("⚠️ 找不到可識別的帳務資料，請檢查格式。")
+            else:
+                with st.spinner(f"正在批次寫入 {len(parsed_data)} 筆資料..."):
+                    for item in parsed_data:
+                        add_transaction(
+                            date_obj=item['date'], 
+                            record_type="支出", 
+                            category=item['category'], 
+                            amount=item['amount'], 
+                            payment_method=item['payment_method'], 
+                            note=item['note'], 
+                            tags=item['tags']
+                        )
+                    st.success(f"✅ 成功匯入 {len(parsed_data)} 筆資料！")
+                    time.sleep(1.5)
+                    st.rerun()
+        else:
+            st.warning("請先輸入文字")
+
+st.sidebar.markdown("---")
+
+# --- 側邊欄：新增交易 (手動單筆) ---
+st.sidebar.header("📝 新增單筆交易")
 record_type = st.sidebar.radio("類型", ["支出", "收入"], horizontal=True)
 
 with st.sidebar.form("expense_form", clear_on_submit=True):
@@ -529,7 +663,6 @@ else:
         else:
             st.info(f"{search_date} 沒有任何交易記錄。")
 
-    # 🔥 Tab 5: 🧮 自訂/多選計算機
     with tab5:
         st.subheader("🧮 自訂/多選計算機")
         st.caption("勾選特定的交易，系統會自動幫您加總。")
@@ -547,7 +680,6 @@ else:
             range_df = df[range_mask].sort_values('date', ascending=False)
         
         else: # 跳選模式
-            # 使用 .dropna() 防止資料庫髒資料導致崩潰
             available_dates = sorted(df['date'].dropna().unique(), reverse=True)
             selected_dates = st.multiselect("請選擇日期 (可多選)", options=available_dates, placeholder="例如: 選擇 1月2號 和 1月8號")
             
@@ -560,7 +692,6 @@ else:
             display_df = range_df[['date', 'type', 'category', 'amount', 'note', 'tags']].copy()
             display_df.insert(0, "Select", False)
             
-            # 🔥 這裡加上 unique key="calc_editor" 防止崩潰
             edited_selection = st.data_editor(
                 display_df,
                 column_config={
